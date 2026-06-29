@@ -730,7 +730,59 @@ Calls ON-FAILURE with error if download fails."
                                  (map-put! (wasabi--state) :silent-refresh t)
                                  (wasabi--initialize :wasabi-buffer (map-elt (wasabi--state) :wasabi-buffer)
                                                      :status-type 'fetch-contacts
-                                                     :status-message (wasabi--make-loading-message)))))))))
+                                                     :status-message (wasabi--make-loading-message)))))
+                            ;; Unrecoverable failures: surface as an error so the
+                            ;; user isn't left staring at "Loading..." forever.
+                            ((equal (map-elt notification 'method) "ClientOutdated")
+                             (map-put! (wasabi--state) :connected nil)
+                             (wasabi--log "Client outdated")
+                             (wasabi--set-status
+                              :type 'error
+                              :message (wasabi--refresh-error
+                                        :message (format "The %s util is too old. Please update."
+                                                         (or (executable-find "wuzapi")
+                                                             "wuzapi")))))
+                            ((equal (map-elt notification 'method) "StreamReplaced")
+                             (map-put! (wasabi--state) :connected nil)
+                             (wasabi--log "Stream replaced")
+                             (wasabi--set-status
+                              :type 'error
+                              :message (wasabi--refresh-error
+                                        :message "WhatsApp session was opened elsewhere. Please close it.")))
+                            ((equal (map-elt notification 'method) "TemporaryBan")
+                             (map-put! (wasabi--state) :connected nil)
+                             (wasabi--log "Temporary ban")
+                             (wasabi--set-status
+                              :type 'error
+                              :message (wasabi--refresh-error
+                                        :message "This WhatsApp account is temporarily banned.")))
+                            ((equal (map-elt notification 'method) "StreamError")
+                             (map-put! (wasabi--state) :connected nil)
+                             (wasabi--log "Stream error")
+                             (wasabi--set-status
+                              :type 'error
+                              :message (wasabi--refresh-error
+                                        :message "WhatsApp connection stream error.")))
+                            ((equal (map-elt notification 'method) "PairError")
+                             (map-put! (wasabi--state) :connected nil)
+                             (wasabi--log "Pair error")
+                             (wasabi--set-status
+                              :type 'error
+                              :message (wasabi--refresh-error
+                                        :message "Pairing with WhatsApp failed.")))
+                            ;; Keep-alive timeout is transient once connected
+                            ;; (whatsmeow reconnects and emits KeepAliveRestored),
+                            ;; but while still loading it can strand us. Only
+                            ;; surface it as an error in that case.
+                            ((equal (map-elt notification 'method) "KeepAliveTimeout")
+                             (let ((status-type (map-nested-elt (wasabi--state) '(:status :type))))
+                               (wasabi--log "KeepAliveTimeout (status-type: %s)" status-type)
+                               (unless (eq status-type 'ready)
+                                 (map-put! (wasabi--state) :connected nil)
+                                 (wasabi--set-status
+                                  :type 'error
+                                  :message (wasabi--refresh-error
+                                            :message "Lost connection to WhatsApp (keep-alive timeout).")))))))))
 
 (defun wasabi--log (format-string &rest args)
   "Log a debug message to *Wasabi-Log* buffer.
