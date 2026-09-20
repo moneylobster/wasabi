@@ -703,6 +703,9 @@ Invoke ON-FINISHED on success."
          (map-put! (wasabi--state) :chats
                    (map-insert (or (map-elt (wasabi--state) :chats) '())
                                chat-jid p-messages))
+         ;; Now that this chat's messages are known, the list can show
+         ;; when it really last saw one.
+         (wasabi--reparse-chat-index)
          (wasabi-chat--start
           :chat-jid chat-jid
           :messages (wasabi-chat--parse-messages
@@ -782,16 +785,15 @@ Invoke ON-FINISHED when done."
                                            ;;   ((chat_jid . "789") (last_updated . "2025-11-19"))
                                            ;;   ((chat_jid . "101") (last_updated . "2025-11-18")))
                                            (p-chats (apply #'append (mapcar (lambda (v) (append v nil)) (map-values response))))
-                                           (chats-index (wasabi--parse-chat-index
-                                                         (mapcar (lambda (p-chat)
+                                           (p-chat-index (mapcar (lambda (p-chat)
                                                                    (cons (map-elt p-chat 'chat_jid) p-chat))
-                                                                 p-chats)
-                                                         (map-elt (wasabi--state) :contacts)
-                                                         (map-elt (wasabi--state) :groups))))
+                                                                 p-chats)))
                                       (wasabi--log "Raw chats from response: %d" (length p-chats))
-                                      (map-put! (wasabi--state) :chats-index chats-index)
-                                      (wasabi--log "Loaded chat index: %d chats" (length chats-index))
-                                      (wasabi--refresh))))
+                                      ;; Kept so the index can be read again
+                                      ;; as contacts arrive and histories
+                                      ;; load, without refetching it.
+                                      (map-put! (wasabi--state) :p-chat-index p-chat-index)
+                                      (wasabi--reparse-chat-index))))
                                   (when on-finished
                                     (funcall on-finished)))
                     :on-failure (lambda (error)
@@ -1196,6 +1198,9 @@ The :connected flag tracks WhatsApp connection state (updated by notifications).
         ;;                       (last_updated . "2025-11-10 18:30:00.000000 +0000 GMT")))
         ;;  ...)
         (cons :chats-index nil)
+        ;; Raw chat index as received, kept so it can be read again
+        ;; when contacts or histories improve what we can say about it.
+        (cons :p-chat-index nil)
         ;; Sample chats structure:
         ;;
         ;; (("1234567890@s.whatsapp.net" . [((chat_jid . "1234567890@s.whatsapp.net")
@@ -1761,17 +1766,19 @@ Returns alist: ((jid1 . group1) (jid2 . group2) ...)"
               (cons jid (wasabi--parse-group p-group))))
           (append p-groups nil)))
 
-(defun wasabi--parse-chat-index-entry (p-chat-entry contacts groups)
+(defun wasabi--parse-chat-index-entry (p-chat-entry contacts groups &optional chats)
   "Parse protocol chat index entry with name enrichment.
 P-CHAT-ENTRY is protocol chat entry:
  (chat-jid . ((chat_jid . ...) (last_updated . ...))).
 CONTACTS is internal contacts alist (already parsed).
 GROUPS is internal groups alist (already parsed).
+CHATS is the :chats alist of already fetched histories.
 Returns alist with :chat-jid, :canonical-jid, :alt-jids, :display-name,
 :named, :is-group and :last-updated."
   (let* ((chat-jid (wasabi--jid-string (car p-chat-entry)))
          (p-metadata (cdr p-chat-entry))
-         (last-updated (map-elt p-metadata 'last_updated))
+         (last-updated (or (wasabi--latest-message-timestamp chat-jid chats)
+                           (map-elt p-metadata 'last_updated)))
          (is-group (wasabi--group-jid-p chat-jid))
          (name (if is-group
                    ;; TODO: Do we need symbols here? Why not keep as string?
@@ -1794,6 +1801,38 @@ Returns alist with :chat-jid, :canonical-jid, :alt-jids, :display-name,
           (cons :named (and name t))
           (cons :is-group (and is-group t))
           (cons :last-updated last-updated))))
+
+(defun wasabi--latest-message-timestamp (chat-jid chats)
+  "Return the newest message timestamp stored for CHAT-JID in CHATS, or nil.
+
+The chat index only records when wuzapi last wrote the row, which after
+a first sync is the moment everything was backfilled rather than when
+each conversation last saw a message.  Where we have already fetched a
+chat's history, the messages themselves know better."
+  (when (and chat-jid chats)
+    (let ((newest nil))
+      (dolist (jid (seq-uniq (cons chat-jid (wasabi--jid-variants chat-jid))))
+        (dolist (p-message (append (map-elt chats jid) nil))
+          (let ((timestamp (map-elt p-message 'timestamp)))
+            (when (and timestamp
+                       (wasabi--timestamp-newer-p timestamp newest))
+              (setq newest timestamp)))))
+      newest)))
+
+(defun wasabi--reparse-chat-index ()
+  "Read the stored chat index again and refresh the display.
+
+Names and times improve as contacts arrive and histories load, so the
+index is read again rather than refetched."
+  (when-let ((p-chat-index (map-elt (wasabi--state) :p-chat-index)))
+    (let ((chats-index (wasabi--parse-chat-index
+                        p-chat-index
+                        (map-elt (wasabi--state) :contacts)
+                        (map-elt (wasabi--state) :groups)
+                        (map-elt (wasabi--state) :chats))))
+      (map-put! (wasabi--state) :chats-index chats-index)
+      (wasabi--log "Loaded chat index: %d chats" (length chats-index))
+      (wasabi--refresh))))
 
 (defun wasabi--merge-chat-index-entries (entries)
   "Merge ENTRIES that address the same peer under different JIDs.
@@ -1824,18 +1863,21 @@ it under that JID and we fetch one history per chat."
             (map-put! existing :named t)))))
     (nreverse merged)))
 
-(defun wasabi--parse-chat-index (p-chat-index contacts groups)
+(defun wasabi--parse-chat-index (p-chat-index contacts groups &optional chats)
   "Parse chat index response to list of internal chat entries.
 P-CHAT-INDEX is the raw response from chat.history with chat_jid='index'.
 CONTACTS is internal contacts alist (already parsed).
 GROUPS is internal groups alist (already parsed).
+CHATS is the :chats alist of already fetched histories, used for real
+message times.
 Returns list of internal chat entry alists, filtered, sorted and merged."
   (let* ((parsed (delq nil
                        (mapcar (lambda (p-entry)
                                  ;; Filter out status broadcasts
                                  (unless (equal (wasabi--jid-string (car p-entry))
                                                 "status@broadcast")
-                                   (wasabi--parse-chat-index-entry p-entry contacts groups)))
+                                   (wasabi--parse-chat-index-entry p-entry contacts
+                                                                   groups chats)))
                                p-chat-index)))
          (sorted (sort parsed
                        (lambda (a b)

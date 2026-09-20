@@ -504,5 +504,54 @@
                                   '((message_id . "B")))))
                  2)))
 
+(ert-deftest wasabi-test-index-prefers-real-message-times ()
+  (wasabi-test--with-clean-jids
+    ;; Both rows were written by the same first sync, so last_updated
+    ;; says nothing about when either chat last saw a message.
+    (let* ((synced-at "2025-11-20T09:00:00Z")
+           (chats (list (cons "1@s.whatsapp.net"
+                              (list '((message_id . "A")
+                                      (timestamp . "2025-11-11T10:00:00Z"))
+                                    '((message_id . "B")
+                                      (timestamp . "2025-11-19T18:00:00Z"))))))
+           (index (wasabi--parse-chat-index
+                   (list (wasabi-test--index-entry "1@s.whatsapp.net" synced-at)
+                         (wasabi-test--index-entry "2@s.whatsapp.net" synced-at))
+                   nil nil chats)))
+      ;; The chat we have messages for is dated by its newest one.
+      (should (equal (map-elt (seq-find (lambda (chat)
+                                          (equal (map-elt chat :chat-jid)
+                                                 "1@s.whatsapp.net"))
+                                        index)
+                              :last-updated)
+                     "2025-11-19T18:00:00Z"))
+      ;; The one we have not loaded keeps what the index said.
+      (should (equal (map-elt (seq-find (lambda (chat)
+                                          (equal (map-elt chat :chat-jid)
+                                                 "2@s.whatsapp.net"))
+                                        index)
+                              :last-updated)
+                     synced-at))
+      ;; And the sync time sorts ahead of the older real one.
+      (should (equal (map-elt (car index) :chat-jid) "2@s.whatsapp.net")))))
+
+(ert-deftest wasabi-test-latest-message-timestamp-spans-jid-variants ()
+  (wasabi-test--with-clean-jids
+    (wasabi--learn-jid-alias "99988877@lid" "447123456789@s.whatsapp.net")
+    ;; History recorded under either JID dates the same conversation.
+    (let ((chats (list (cons "99988877@lid"
+                             (list '((timestamp . "2025-11-11T10:00:00Z"))))
+                       (cons "447123456789@s.whatsapp.net"
+                             (list '((timestamp . "2025-11-19T18:00:00Z")))))))
+      (should (equal (wasabi--latest-message-timestamp "99988877@lid" chats)
+                     "2025-11-19T18:00:00Z")))))
+
+(ert-deftest wasabi-test-latest-message-timestamp-without-history ()
+  (wasabi-test--with-clean-jids
+    (should-not (wasabi--latest-message-timestamp "1@s.whatsapp.net" nil))
+    (should-not (wasabi--latest-message-timestamp
+                 "1@s.whatsapp.net"
+                 (list (cons "1@s.whatsapp.net" (list '((message_id . "A")))))))))
+
 (provide 'wasabi-test)
 ;;; wasabi-test.el ends here
