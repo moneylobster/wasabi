@@ -384,6 +384,105 @@ Callers save once per batch of learning rather than per pairing."
         (dolist (entry chat-times)
           (puthash (car entry) (cdr entry) wasabi--chat-times-table))))))
 
+(defcustom wasabi-jid-resolve-batch-size 20
+  "How many phone numbers `wasabi-resolve-jids' asks about at once.
+
+Kept modest on purpose: asking WhatsApp about a great many numbers in
+one go is what bulk contact scrapers do, and is worth not looking like."
+  :type 'natnum
+  :group 'wasabi)
+
+(defun wasabi--learn-from-check-response (response)
+  "Pair the phone numbers in a \"user.check\" RESPONSE with their JIDs.
+
+Returns how many pairings were new."
+  (let ((learned 0))
+    (dolist (user (append (map-elt response 'Users) nil))
+      (let ((query (map-elt user 'Query))
+            (jid (map-elt user 'JID)))
+        (when (and (wasabi--jid-string query)
+                   (wasabi--jid-string jid)
+                   (wasabi--learn-jid-alias
+                    (concat (string-remove-prefix "+" query) "@s.whatsapp.net")
+                    jid))
+          (setq learned (1+ learned)))))
+    learned))
+
+(defun wasabi--unpaired-chat-numbers ()
+  "Return the phone numbers of chats with no known linked identity."
+  (delq nil
+        (mapcar (lambda (chat)
+                  (let ((jid (map-elt chat :chat-jid)))
+                    (when (and jid
+                               (string-suffix-p "@s.whatsapp.net" jid)
+                               ;; Only one JID known for it, so nothing
+                               ;; has paired it up yet.
+                               (null (cdr (wasabi--jid-variants jid))))
+                      (wasabi--jid-identifier jid))))
+                (map-elt (wasabi--state) :chats-index))))
+
+(cl-defun wasabi--resolve-jids-batch (&key numbers resolved on-complete)
+  "Ask WhatsApp about NUMBERS, a batch at a time.
+
+RESOLVED counts the pairings learned so far.  Calls ON-COMPLETE with
+the total.  A batch that fails is logged and skipped rather than losing
+the rest."
+  (if (null numbers)
+      (funcall on-complete resolved)
+    (let ((batch (seq-take numbers wasabi-jid-resolve-batch-size))
+          (rest (seq-drop numbers wasabi-jid-resolve-batch-size)))
+      (acp-send-request
+       :client (map-elt (wasabi--state) :client)
+       :request (wasabi--make-user-check-request
+                 :token wasabi-user-token
+                 :phones batch)
+       :on-success (lambda (response)
+                     (let ((learned (wasabi--learn-from-check-response response)))
+                       (wasabi--resolve-jids-batch
+                        :numbers rest
+                        :resolved (+ resolved learned)
+                        :on-complete on-complete)))
+       :on-failure (lambda (error)
+                     (wasabi--log "Couldn't resolve a batch of %d: %s"
+                                  (length batch)
+                                  (or (map-elt error 'message) "unknown"))
+                     (wasabi--resolve-jids-batch
+                      :numbers rest
+                      :resolved resolved
+                      :on-complete on-complete))))))
+
+;;;###autoload
+(defun wasabi-resolve-jids ()
+  "Pair each phone number chat with the linked identity behind it.
+
+WhatsApp has moved to addressing people by a linked identity rather
+than their phone number, and wuzapi files a conversation under whichever
+of the two each message arrived with.  One conversation then sits in two
+halves: what you sent under one JID, what they replied under the other,
+each with its own dates.
+
+Messages report the pairing only as they arrive live, and never on
+history, so a conversation that moved before you paired this client
+cannot be put back together from what is stored.  Asking WhatsApp which
+JID a phone number belongs to is the one way to recover it.
+
+Pairings are cached, so this is worth running once rather than often."
+  (interactive)
+  (unless (derived-mode-p 'wasabi-mode)
+    (user-error "Not in a chats buffer"))
+  (let ((numbers (wasabi--unpaired-chat-numbers)))
+    (if (null numbers)
+        (message "Every chat already knows its linked identity")
+      (message "Asking WhatsApp about %d chats..." (length numbers))
+      (wasabi--resolve-jids-batch
+       :numbers numbers
+       :resolved 0
+       :on-complete
+       (lambda (learned)
+         (wasabi--save-jid-aliases)
+         (wasabi--reparse-chat-index)
+         (message "Paired %d of %d chats" learned (length numbers)))))))
+
 (defun wasabi--find-contacts (jid contacts)
   "Return every CONTACTS entry addressing the same peer as JID.
 
@@ -2043,6 +2142,26 @@ Requires user TOKEN."
   `((:method . "user.contacts")
     (:params . ((token . ,token)))))
 
+(cl-defun wasabi--make-user-check-request (&key token phones)
+  "Instantiate a \"user.check\" request.
+
+  Required parameters:
+    TOKEN - User authentication token
+    PHONES - List of phone numbers, with country code and no \"+\"
+
+  Asks WhatsApp which of PHONES are on WhatsApp.  Each answer carries
+  the JID that number belongs to, which since the move to linked
+  identities is that contact's LID.  That is the one place the pairing
+  between a phone number and a LID can be had: messages report it only
+  as they arrive live, and never on history."
+  (unless token
+    (error ":token is required"))
+  (unless phones
+    (error ":phones is required"))
+  `((:method . "user.check")
+    (:params . ((token . ,token)
+                (Phone . ,(vconcat phones))))))
+
 (cl-defun wasabi--make-group-list-request (&key token)
   "Instantiate a \"group.list\" request to get all groups.
 
@@ -2345,21 +2464,42 @@ Returns a string like \"@s.whatsapp.net 200, @lid 150\"."
                                   :null-object nil :false-object nil)
                'Info))))
 
+(defun wasabi--filled-p (value)
+  "Return non-nil when VALUE is something rather than an empty nothing.
+
+A protocol field can be present and still say nothing: whatsmeow writes
+an empty string where it has no JID or name to give."
+  (and value
+       (not (equal value ""))
+       (not (equal value :null))))
+
 (defun wasabi--insert-info-report (messages)
   "Report what the Info of MESSAGES carries, into the current buffer.
 
 Whether a conversation's LID and phone number addressing can ever be
-paired up turns on whether SenderAlt and RecipientAlt are there."
+paired up turns on SenderAlt and RecipientAlt carrying a JID, and
+naming its sender turns on PushName carrying a name.  Counted by what
+they hold, not by whether the field is there: it always is."
   (let ((infos (delq nil (mapcar #'wasabi--message-info messages))))
     (insert (format "    with data_json: %d of %d\n"
                     (length infos) (length messages)))
     (when infos
-      (insert (format "    Info keys: %s\n"
-                      (mapconcat #'symbol-name (mapcar #'car (car infos)) " ")))
-      (insert (format "    with SenderAlt: %d   with RecipientAlt: %d\n"
-                      (seq-count (lambda (info) (map-elt info 'SenderAlt)) infos)
-                      (seq-count (lambda (info) (map-elt info 'RecipientAlt))
+      (insert (format "    of %d Info: SenderAlt %d, RecipientAlt %d, PushName %d\n"
+                      (length infos)
+                      (seq-count (lambda (info)
+                                   (wasabi--filled-p (map-elt info 'SenderAlt)))
+                                 infos)
+                      (seq-count (lambda (info)
+                                   (wasabi--filled-p (map-elt info 'RecipientAlt)))
+                                 infos)
+                      (seq-count (lambda (info)
+                                   (wasabi--filled-p (map-elt info 'PushName)))
                                  infos)))
+      (insert (format "    incoming: %d   IsFromMe: %d\n"
+                      (seq-count (lambda (info)
+                                   (not (map-elt info 'IsFromMe)))
+                                 infos)
+                      (seq-count (lambda (info) (map-elt info 'IsFromMe)) infos)))
       (insert (format "    Info.Chat keyed by: %s\n"
                       (wasabi--tally infos
                                      (lambda (info)
@@ -2370,11 +2510,18 @@ paired up turns on whether SenderAlt and RecipientAlt are there."
                                      (lambda (info)
                                        (wasabi--jid-server
                                         (map-elt info 'Sender))))))
+      (insert (format "    Info.SenderAlt: %s\n"
+                      (wasabi--tally infos
+                                     (lambda (info)
+                                       (let ((alt (map-elt info 'SenderAlt)))
+                                         (if (wasabi--filled-p alt)
+                                             (wasabi--jid-server alt)
+                                           (format "empty %S" alt)))))))
       (insert (format "    addressing modes: %s\n"
                       (wasabi--tally infos
                                      (lambda (info)
-                                       (format "%s" (or (map-elt info 'AddressingMode)
-                                                        "(none)")))))))))
+                                       (format "%S" (map-elt info
+                                                             'AddressingMode)))))))))
 
 (defun wasabi--describe-timestamp (timestamp)
   "Describe how TIMESTAMP reads, for a diagnostics report."
