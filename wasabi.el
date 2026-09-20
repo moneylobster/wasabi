@@ -2299,6 +2299,156 @@ Optional parameters:
     ;; Convert points to pixels (assuming 96 DPI)
     (round (* height-points 96.0 (/ 1.0 72.0)))))
 
+;;; Diagnostics
+
+(defun wasabi--jid-server (jid)
+  "Return the server part of JID, the bit after the \"@\"."
+  (when-let ((jid (wasabi--jid-string jid)))
+    (if (string-match "@\\(.+\\)\\'" jid)
+        (concat "@" (match-string 1 jid))
+      "(none)")))
+
+(defun wasabi--tally (items key-function)
+  "Tally ITEMS by KEY-FUNCTION, most common first.
+Returns a string like \"@s.whatsapp.net 200, @lid 150\"."
+  (let ((counts (make-hash-table :test 'equal))
+        (tallied '()))
+    (dolist (item items)
+      (let ((key (or (funcall key-function item) "(none)")))
+        (puthash key (1+ (gethash key counts 0)) counts)))
+    (maphash (lambda (key count) (push (cons key count) tallied)) counts)
+    (if (null tallied)
+        "none"
+      (mapconcat (lambda (entry) (format "%s %d" (car entry) (cdr entry)))
+                 (sort tallied (lambda (a b) (> (cdr a) (cdr b))))
+                 ", "))))
+
+(defun wasabi--describe-timestamp (timestamp)
+  "Describe how TIMESTAMP reads, for a diagnostics report."
+  (let ((parsed (wasabi--parse-timestamp timestamp)))
+    (format "%S (%s) -> %s"
+            timestamp
+            (type-of timestamp)
+            (if parsed
+                (format-time-string "%Y-%m-%dT%H:%M:%S%z" parsed)
+              "UNREADABLE"))))
+
+;;;###autoload
+(defun wasabi-diagnose ()
+  "Report what `wasabi' knows, for working out what it is getting wrong.
+
+Shows counts, shapes and timestamps rather than contents: no names,
+phone numbers or message text, so the report is safe to paste into a
+bug report."
+  (interactive)
+  (let* ((state (buffer-local-value 'wasabi--state (wasabi--buffer)))
+         (contacts (map-elt state :contacts))
+         (index (map-elt state :chats-index))
+         (p-index (map-elt state :p-chat-index))
+         (chats (map-elt state :chats))
+         (buffer (get-buffer-create "*Wasabi Diagnostics*")))
+    (unless state
+      (user-error "Wasabi has no state yet.  Start it with M-x wasabi"))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "Wasabi diagnostics\n")
+        (insert "==================\n\n")
+        (insert (format "emacs %s, image types: %s
+"
+                        emacs-version
+                        (mapconcat #'symbol-name
+                                   (seq-filter #'image-type-available-p
+                                               '(svg png jpeg gif webp))
+                                   " ")))
+        (insert (format "status: %s   connected: %s   syncing: %s\n"
+                        (map-nested-elt state '(:status :type))
+                        (if (map-elt state :connected) "yes" "no")
+                        (or (map-elt state :syncing) "no")))
+        (insert (format "JID pairings learned: %d\n\n"
+                        (hash-table-count wasabi--jid-canonical-table)))
+
+        (insert (format "Contacts: %d\n" (length contacts)))
+        (insert (format "  with a saved name: %d\n"
+                        (seq-count (lambda (contact)
+                                     (map-elt (cdr contact) :full-name))
+                                   contacts)))
+        (insert (format "  with a push name:  %d\n"
+                        (seq-count (lambda (contact)
+                                     (map-elt (cdr contact) :push-name))
+                                   contacts)))
+        (insert (format "  keyed by:          %s\n\n"
+                        (wasabi--tally contacts
+                                       (lambda (contact)
+                                         (wasabi--jid-server (car contact))))))
+
+        (insert (format "Chat index: %d\n" (length index)))
+        (insert (format "  named:             %d\n"
+                        (seq-count (lambda (chat) (map-elt chat :named)) index)))
+        (insert (format "  showing a raw JID: %d\n"
+                        (seq-count (lambda (chat)
+                                     (not (map-elt chat :named)))
+                                   index)))
+        (insert (format "  merged rows:       %d\n"
+                        (seq-count (lambda (chat) (map-elt chat :alt-jids))
+                                   index)))
+        (insert (format "  keyed by:          %s\n"
+                        (wasabi--tally index
+                                       (lambda (chat)
+                                         (wasabi--jid-server
+                                          (map-elt chat :chat-jid))))))
+        (insert (format "  dated by messages: %d\n"
+                        (seq-count (lambda (chat)
+                                     (wasabi--latest-message-timestamp
+                                      (map-elt chat :chat-jid) chats))
+                                   index)))
+        ;; One distinct value means every row was written by the same
+        ;; sync, which is why they all claim the same time.
+        (insert (format "  distinct last_updated values: %d of %d rows\n"
+                        (length (seq-uniq (mapcar (lambda (entry)
+                                                    (map-elt (cdr entry)
+                                                             'last_updated))
+                                                  p-index)))
+                        (length p-index)))
+        (when p-index
+          (insert (format "  sample last_updated: %s\n"
+                          (wasabi--describe-timestamp
+                           (map-elt (cdr (car p-index)) 'last_updated)))))
+        (insert "\n")
+
+        (insert (format "Loaded histories: %d\n" (length chats)))
+        (if (null chats)
+            (insert "  (open a chat first: timestamps are read from its messages)\n")
+          (dolist (chat (seq-take chats 3))
+            (let* ((messages (append (cdr chat) nil))
+                   (message (car messages)))
+              (insert (format "  %s: %d messages\n"
+                              (wasabi--jid-server (car chat))
+                              (length messages)))
+              (insert (format "    keys: %s\n"
+                              (mapconcat #'symbol-name (mapcar #'car message)
+                                         " ")))
+              (insert (format "    timestamp: %s\n"
+                              (wasabi--describe-timestamp
+                               (or (map-elt message 'timestamp)
+                                   (map-elt message 'Timestamp)
+                                   (map-elt message 'message_timestamp)))))
+              (insert (format "    unreadable timestamps: %d of %d\n"
+                              (seq-count (lambda (p-message)
+                                           (not (wasabi--parse-timestamp
+                                                 (or (map-elt p-message 'timestamp)
+                                                     (map-elt p-message 'Timestamp)
+                                                     (map-elt p-message
+                                                              'message_timestamp)))))
+                                         messages)
+                              (length messages)))
+              (insert (format "    newest: %s\n"
+                              (or (wasabi--latest-message-timestamp (car chat) chats)
+                                  "none readable"))))))
+        (goto-char (point-min))
+        (special-mode)))
+    (switch-to-buffer buffer)))
+
 (provide 'wasabi)
 
 ;;; wasabi.el ends here
