@@ -743,5 +743,66 @@
             (should (assq key wasabi--state))))
       (kill-buffer buffer))))
 
+(ert-deftest wasabi-test-check-request-shape ()
+  (let ((request (wasabi--make-user-check-request
+                  :token "tok" :phones '("447123456789" "447999999999"))))
+    (should (equal (map-elt request :method) "user.check"))
+    (should (equal (map-nested-elt request '(:params token)) "tok"))
+    ;; A vector, since it goes out as a JSON array.
+    (should (equal (map-nested-elt request '(:params Phone))
+                   ["447123456789" "447999999999"])))
+  (should-error (wasabi--make-user-check-request :token "tok"))
+  (should-error (wasabi--make-user-check-request :phones '("1"))))
+
+(ert-deftest wasabi-test-learn-pairings-from-a-check-response ()
+  (wasabi-test--with-clean-jids
+    ;; What WhatsApp answers: the number asked about, and the JID it
+    ;; belongs to, which is now a linked identity.
+    (let ((response '((Users . [((IsInWhatsapp . t)
+                                 (JID . "99988877@lid")
+                                 (Query . "447123456789")
+                                 (VerifiedName . ""))
+                                ((IsInWhatsapp . t)
+                                 (JID . "11122233@lid")
+                                 (Query . "+447999999999")
+                                 (VerifiedName . ""))]))))
+      (should (equal (wasabi--learn-from-check-response response) 2))
+      (should (wasabi--same-chat-p "447123456789@s.whatsapp.net" "99988877@lid"))
+      ;; A leading + on the query is not part of the JID.
+      (should (wasabi--same-chat-p "447999999999@s.whatsapp.net" "11122233@lid"))
+      ;; The phone number stays canonical, so that is what we send to.
+      (should (equal (wasabi--canonical-jid "99988877@lid")
+                     "447123456789@s.whatsapp.net"))
+      ;; Asking twice teaches nothing twice.
+      (should (equal (wasabi--learn-from-check-response response) 0)))))
+
+(ert-deftest wasabi-test-check-response-without-a-pairing ()
+  (wasabi-test--with-clean-jids
+    ;; Someone not on WhatsApp, and an answer with nothing in it.
+    (should (equal (wasabi--learn-from-check-response
+                    '((Users . [((IsInWhatsapp . :false)
+                                 (JID . "")
+                                 (Query . "447123456789"))])))
+                   0))
+    (should (equal (wasabi--learn-from-check-response '((Users . []))) 0))
+    (should (equal (wasabi--learn-from-check-response nil) 0))))
+
+(ert-deftest wasabi-test-check-response-pairs-the-chat-index ()
+  (wasabi-test--with-clean-jids
+    (wasabi--learn-from-check-response
+     '((Users . [((JID . "99988877@lid") (Query . "447123456789"))])))
+    ;; The two halves of one conversation become one row, keeping the
+    ;; most recent JID and noting the other.
+    (let ((index (wasabi--parse-chat-index
+                  (list (wasabi-test--index-entry "447123456789@s.whatsapp.net"
+                                                  "2026-07-26T01:50:06Z")
+                        (wasabi-test--index-entry "99988877@lid"
+                                                  "2026-09-21T00:12:28Z"))
+                  nil nil nil)))
+      (should (equal (length index) 1))
+      (should (equal (map-elt (car index) :chat-jid) "99988877@lid"))
+      (should (equal (map-elt (car index) :alt-jids)
+                     '("447123456789@s.whatsapp.net"))))))
+
 (provide 'wasabi-test)
 ;;; wasabi-test.el ends here
