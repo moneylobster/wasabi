@@ -18,6 +18,7 @@
   `(let ((wasabi--jid-canonical-table (make-hash-table :test 'equal))
          (wasabi--jid-variants-table (make-hash-table :test 'equal))
          (wasabi--push-names-table (make-hash-table :test 'equal))
+         (wasabi--chat-times-table (make-hash-table :test 'equal))
          (wasabi-data-dir (make-temp-file "wasabi-test" t)))
      ,@body))
 
@@ -558,29 +559,58 @@
 
 (ert-deftest wasabi-test-remember-chat-time-keeps-the-newest ()
   (wasabi-test--with-clean-jids
-    (let ((buffer (generate-new-buffer "*wasabi-times-test*")))
-      (unwind-protect
-          (with-current-buffer buffer
-            (wasabi-mode)
-            (setq wasabi--state (wasabi--make-state :wasabi-buffer buffer))
-            (wasabi--remember-chat-time "1@s.whatsapp.net" "2025-11-19T18:00:00Z")
-            (should (equal (wasabi--latest-message-timestamp
-                            "1@s.whatsapp.net"
-                            (map-elt wasabi--state :chat-times))
-                           "2025-11-19T18:00:00Z"))
-            ;; An older message does not un-date the chat.
-            (wasabi--remember-chat-time "1@s.whatsapp.net" "2025-11-11T10:00:00Z")
-            (should (equal (wasabi--latest-message-timestamp
-                            "1@s.whatsapp.net"
-                            (map-elt wasabi--state :chat-times))
-                           "2025-11-19T18:00:00Z"))
-            ;; Nor does one we cannot read.
-            (wasabi--remember-chat-time "1@s.whatsapp.net" "nonsense")
-            (should (equal (wasabi--latest-message-timestamp
-                            "1@s.whatsapp.net"
-                            (map-elt wasabi--state :chat-times))
-                           "2025-11-19T18:00:00Z")))
-        (kill-buffer buffer)))))
+    (wasabi--remember-chat-time "1@s.whatsapp.net" "2025-11-19T18:00:00Z")
+    (should (equal (wasabi--latest-message-timestamp
+                    "1@s.whatsapp.net" wasabi--chat-times-table)
+                   "2025-11-19T18:00:00Z"))
+    ;; An older message does not un-date the chat.
+    (wasabi--remember-chat-time "1@s.whatsapp.net" "2025-11-11T10:00:00Z")
+    (should (equal (wasabi--latest-message-timestamp
+                    "1@s.whatsapp.net" wasabi--chat-times-table)
+                   "2025-11-19T18:00:00Z"))
+    ;; Nor does one we cannot read.
+    (wasabi--remember-chat-time "1@s.whatsapp.net" "nonsense")
+    (should (equal (wasabi--latest-message-timestamp
+                    "1@s.whatsapp.net" wasabi--chat-times-table)
+                   "2025-11-19T18:00:00Z"))))
+
+(ert-deftest wasabi-test-remembered-under-one-jid-found-under-the-other ()
+  (wasabi-test--with-clean-jids
+    (wasabi--learn-jid-alias "99988877@lid" "447123456789@s.whatsapp.net")
+    (wasabi--remember-chat-time "99988877@lid" "2025-11-19T18:00:00Z")
+    (should (equal (wasabi--latest-message-timestamp
+                    "447123456789@s.whatsapp.net" wasabi--chat-times-table)
+                   "2025-11-19T18:00:00Z"))))
+
+(ert-deftest wasabi-test-cached-identities-round-trip ()
+  (wasabi-test--with-clean-jids
+    (wasabi--learn-jid-alias "99988877@lid" "447123456789@s.whatsapp.net")
+    (wasabi--learn-push-name "99988877@lid" "Johnny")
+    (wasabi--remember-chat-time "99988877@lid" "2025-11-19T18:00:00Z")
+    (wasabi--save-jid-aliases)
+    (clrhash wasabi--jid-canonical-table)
+    (clrhash wasabi--jid-variants-table)
+    (clrhash wasabi--push-names-table)
+    (clrhash wasabi--chat-times-table)
+    (wasabi--load-jid-aliases)
+    ;; All three survive a restart, so a chat keeps its date and its
+    ;; name without being opened again.
+    (should (wasabi--same-chat-p "99988877@lid" "447123456789@s.whatsapp.net"))
+    (should (equal (wasabi--known-push-name "99988877@lid") "Johnny"))
+    (should (equal (wasabi--latest-message-timestamp
+                    "99988877@lid" wasabi--chat-times-table)
+                   "2025-11-19T18:00:00Z"))))
+
+(ert-deftest wasabi-test-cached-identities-read-the-old-format ()
+  (wasabi-test--with-clean-jids
+    ;; A cache written before push names and chat times were kept holds
+    ;; the bare list of pairings.
+    (with-temp-file (wasabi--jid-aliases-file)
+      (prin1 (list (cons "447123456789@s.whatsapp.net"
+                         (list "447123456789@s.whatsapp.net" "99988877@lid")))
+             (current-buffer)))
+    (wasabi--load-jid-aliases)
+    (should (wasabi--same-chat-p "99988877@lid" "447123456789@s.whatsapp.net"))))
 
 ;;; Names taken from the messages themselves
 
@@ -709,8 +739,7 @@
           (wasabi-mode)
           (setq wasabi--state (wasabi--make-state :wasabi-buffer buffer))
           (dolist (key '(:client :status :connected :contacts :chats-index
-                                 :p-chat-index :chats :chat-times :groups
-                                 :silent-refresh))
+                                 :p-chat-index :chats :groups :silent-refresh))
             (should (assq key wasabi--state))))
       (kill-buffer buffer))))
 
