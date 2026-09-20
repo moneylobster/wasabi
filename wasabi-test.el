@@ -17,6 +17,7 @@
   (declare (indent 0))
   `(let ((wasabi--jid-canonical-table (make-hash-table :test 'equal))
          (wasabi--jid-variants-table (make-hash-table :test 'equal))
+         (wasabi--push-names-table (make-hash-table :test 'equal))
          (wasabi-data-dir (make-temp-file "wasabi-test" t)))
      ,@body))
 
@@ -74,7 +75,7 @@
 (ert-deftest wasabi-test-learn-from-incoming-message-info ()
   (wasabi-test--with-clean-jids
     ;; An incoming one-to-one message addressed by LID.
-    (wasabi--learn-jid-aliases-from-info
+    (wasabi--learn-from-message-info
      '((Chat . "99988877@lid")
        (Sender . "99988877@lid")
        (SenderAlt . "447123456789@s.whatsapp.net")
@@ -85,7 +86,7 @@
 (ert-deftest wasabi-test-learn-from-outgoing-message-info ()
   (wasabi-test--with-clean-jids
     ;; A message we sent: the peer's other addressing is in RecipientAlt.
-    (wasabi--learn-jid-aliases-from-info
+    (wasabi--learn-from-message-info
      '((Chat . "99988877@lid")
        (Sender . "1111@lid")
        (RecipientAlt . "447123456789@s.whatsapp.net")
@@ -96,7 +97,7 @@
 (ert-deftest wasabi-test-learn-from-group-message-info ()
   (wasabi-test--with-clean-jids
     ;; In a group, only the participant is aliased, never the group.
-    (wasabi--learn-jid-aliases-from-info
+    (wasabi--learn-from-message-info
      '((Chat . "120363000000000000@g.us")
        (Sender . "99988877@lid")
        (SenderAlt . "447123456789@s.whatsapp.net")
@@ -511,15 +512,13 @@
     ;; Both rows were written by the same first sync, so last_updated
     ;; says nothing about when either chat last saw a message.
     (let* ((synced-at "2025-11-20T09:00:00Z")
-           (chats (list (cons "1@s.whatsapp.net"
-                              (list '((message_id . "A")
-                                      (timestamp . "2025-11-11T10:00:00Z"))
-                                    '((message_id . "B")
-                                      (timestamp . "2025-11-19T18:00:00Z"))))))
+           ;; Remembered off the messages as the history loaded: wuzapi's
+           ;; own row timestamps record the sync, not the conversation.
+           (times (list (cons "1@s.whatsapp.net" "2025-11-19T18:00:00Z")))
            (index (wasabi--parse-chat-index
                    (list (wasabi-test--index-entry "1@s.whatsapp.net" synced-at)
                          (wasabi-test--index-entry "2@s.whatsapp.net" synced-at))
-                   nil nil chats)))
+                   nil nil times)))
       ;; The chat we have messages for is dated by its newest one.
       (should (equal (map-elt (seq-find (lambda (chat)
                                           (equal (map-elt chat :chat-jid)
@@ -540,12 +539,14 @@
 (ert-deftest wasabi-test-latest-message-timestamp-spans-jid-variants ()
   (wasabi-test--with-clean-jids
     (wasabi--learn-jid-alias "99988877@lid" "447123456789@s.whatsapp.net")
-    ;; History recorded under either JID dates the same conversation.
-    (let ((chats (list (cons "99988877@lid"
-                             (list '((timestamp . "2025-11-11T10:00:00Z"))))
-                       (cons "447123456789@s.whatsapp.net"
-                             (list '((timestamp . "2025-11-19T18:00:00Z")))))))
-      (should (equal (wasabi--latest-message-timestamp "99988877@lid" chats)
+    ;; Remembered under whichever JID loaded, found under either: one
+    ;; conversation, one time.
+    (let ((times (list (cons "447123456789@s.whatsapp.net"
+                             "2025-11-19T18:00:00Z"))))
+      (should (equal (wasabi--latest-message-timestamp "99988877@lid" times)
+                     "2025-11-19T18:00:00Z"))
+      (should (equal (wasabi--latest-message-timestamp
+                      "447123456789@s.whatsapp.net" times)
                      "2025-11-19T18:00:00Z")))))
 
 (ert-deftest wasabi-test-latest-message-timestamp-without-history ()
@@ -553,7 +554,102 @@
     (should-not (wasabi--latest-message-timestamp "1@s.whatsapp.net" nil))
     (should-not (wasabi--latest-message-timestamp
                  "1@s.whatsapp.net"
-                 (list (cons "1@s.whatsapp.net" (list '((message_id . "A")))))))))
+                 (list (cons "2@s.whatsapp.net" "2025-11-19T18:00:00Z"))))))
+
+(ert-deftest wasabi-test-remember-chat-time-keeps-the-newest ()
+  (wasabi-test--with-clean-jids
+    (let ((buffer (generate-new-buffer "*wasabi-times-test*")))
+      (unwind-protect
+          (with-current-buffer buffer
+            (wasabi-mode)
+            (setq wasabi--state (wasabi--make-state :wasabi-buffer buffer))
+            (wasabi--remember-chat-time "1@s.whatsapp.net" "2025-11-19T18:00:00Z")
+            (should (equal (wasabi--latest-message-timestamp
+                            "1@s.whatsapp.net"
+                            (map-elt wasabi--state :chat-times))
+                           "2025-11-19T18:00:00Z"))
+            ;; An older message does not un-date the chat.
+            (wasabi--remember-chat-time "1@s.whatsapp.net" "2025-11-11T10:00:00Z")
+            (should (equal (wasabi--latest-message-timestamp
+                            "1@s.whatsapp.net"
+                            (map-elt wasabi--state :chat-times))
+                           "2025-11-19T18:00:00Z"))
+            ;; Nor does one we cannot read.
+            (wasabi--remember-chat-time "1@s.whatsapp.net" "nonsense")
+            (should (equal (wasabi--latest-message-timestamp
+                            "1@s.whatsapp.net"
+                            (map-elt wasabi--state :chat-times))
+                           "2025-11-19T18:00:00Z")))
+        (kill-buffer buffer)))))
+
+;;; Names taken from the messages themselves
+
+(ert-deftest wasabi-test-push-name-learned-from-a-message ()
+  (wasabi-test--with-clean-jids
+    ;; Nobody saved, and no contact entry at all: all we have to go on
+    ;; is what they called themselves when they wrote.
+    (should-not (wasabi--contact-display-name "99988877@lid" nil))
+    (wasabi--learn-from-message-info
+     (list (cons 'Chat "99988877@lid")
+           (cons 'Sender "99988877@lid")
+           (cons 'PushName "Johnny")
+           (cons 'IsFromMe nil)
+           (cons 'IsGroup nil)))
+    (should (equal (wasabi--known-push-name "99988877@lid") "Johnny"))
+    (should (equal (wasabi--contact-display-name "99988877@lid" nil) "~Johnny"))))
+
+(ert-deftest wasabi-test-push-name-not-learned-from-ourselves ()
+  (wasabi-test--with-clean-jids
+    ;; Our own name on our own message says nothing about anyone else.
+    (wasabi--learn-from-message-info
+     (list (cons 'Chat "99988877@lid")
+           (cons 'Sender "1111@lid")
+           (cons 'PushName "Me Myself")
+           (cons 'IsFromMe t)
+           (cons 'IsGroup nil)))
+    (should-not (wasabi--known-push-name "1111@lid"))))
+
+(ert-deftest wasabi-test-saved-name-still-beats-a-learned-push-name ()
+  (wasabi-test--with-clean-jids
+    (wasabi--learn-from-message-info
+     (list (cons 'Sender "447123456789@s.whatsapp.net")
+           (cons 'PushName "Johnny")
+           (cons 'IsFromMe nil)))
+    (let ((contacts (list (cons (intern "447123456789@s.whatsapp.net")
+                                (list (cons :full-name "John Smith"))))))
+      (should (equal (wasabi--contact-display-name
+                      "447123456789@s.whatsapp.net" contacts)
+                     "John Smith")))))
+
+(ert-deftest wasabi-test-push-name-found-across-jid-variants ()
+  (wasabi-test--with-clean-jids
+    ;; Learned from a LID-addressed message, wanted for a chat the index
+    ;; keys by phone number.
+    (wasabi--learn-from-message-info
+     (list (cons 'Chat "99988877@lid")
+           (cons 'Sender "99988877@lid")
+           (cons 'SenderAlt "447123456789@s.whatsapp.net")
+           (cons 'PushName "Johnny")
+           (cons 'IsFromMe nil)
+           (cons 'IsGroup nil)))
+    (should (equal (wasabi--contact-display-name
+                    "447123456789@s.whatsapp.net" nil)
+                   "~Johnny"))))
+
+(ert-deftest wasabi-test-chat-index-names-from-a-learned-push-name ()
+  (wasabi-test--with-clean-jids
+    (wasabi--learn-from-message-info
+     (list (cons 'Chat "447123456789@s.whatsapp.net")
+           (cons 'Sender "447123456789@s.whatsapp.net")
+           (cons 'PushName "Johnny")
+           (cons 'IsFromMe nil)
+           (cons 'IsGroup nil)))
+    (let ((index (wasabi--parse-chat-index
+                  (list (wasabi-test--index-entry "447123456789@s.whatsapp.net"
+                                                  "2025-11-11T12:00:00Z"))
+                  nil nil nil)))
+      ;; A bare phone number becomes a name, marked as their own.
+      (should (equal (map-elt (car index) :display-name) "~Johnny")))))
 
 (ert-deftest wasabi-test-parse-epoch-timestamps ()
   ;; Compared as instants: Emacs has several representations of one.
@@ -577,13 +673,11 @@
 
 (ert-deftest wasabi-test-index-dates-chats-from-epoch-messages ()
   (wasabi-test--with-clean-jids
-    (let* ((chats (list (cons "1@s.whatsapp.net"
-                              (list '((message_id . "A") (timestamp . 1762862400))
-                                    '((message_id . "B") (timestamp . 1763380800))))))
+    (let* ((times (list (cons "1@s.whatsapp.net" 1763380800)))
            (index (wasabi--parse-chat-index
                    (list (wasabi-test--index-entry "1@s.whatsapp.net"
                                                    "2025-11-20T09:00:00Z"))
-                   nil nil chats)))
+                   nil nil times)))
       (should (time-equal-p (wasabi--parse-timestamp
                              (map-elt (car index) :last-updated))
                             (wasabi--parse-timestamp 1763380800))))))
@@ -615,7 +709,8 @@
           (wasabi-mode)
           (setq wasabi--state (wasabi--make-state :wasabi-buffer buffer))
           (dolist (key '(:client :status :connected :contacts :chats-index
-                                 :p-chat-index :chats :groups :silent-refresh))
+                                 :p-chat-index :chats :chat-times :groups
+                                 :silent-refresh))
             (should (assq key wasabi--state))))
       (kill-buffer buffer))))
 
