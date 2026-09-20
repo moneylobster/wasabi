@@ -176,6 +176,9 @@ it is required internally by the process.")
 (defvar wasabi--jid-variants-table (make-hash-table :test 'equal)
   "Map of canonical JID to all JIDs known to address the same peer.")
 
+(defvar wasabi--push-names-table (make-hash-table :test 'equal)
+  "Map of JID to the name its owner goes by, as seen on their messages.")
+
 (defvar wasabi--jid-aliases-dirty nil
   "Non-nil when learned JID pairings have yet to be written to disk.")
 
@@ -264,12 +267,44 @@ Return non-nil when this taught us something new."
         (wasabi--log "Learned JID alias: %s" (string-join members " = "))
         (setq wasabi--jid-aliases-dirty t)))))
 
-(defun wasabi--learn-jid-aliases-from-info (p-info)
-  "Learn JID pairings from a protocol message P-INFO.
+(defun wasabi--learn-push-name (jid push-name)
+  "Record that JID goes by PUSH-NAME.
+
+Return non-nil when this taught us something new.
+
+The contact list only knows the people WhatsApp has got round to
+sending, and knows no name at all for most of them.  Every message
+carries its sender's chosen name, though, so anyone who has written to
+us can be named from their own messages."
+  (let ((jid (wasabi--normalize-jid jid)))
+    (when (and jid
+               (stringp push-name)
+               (not (string-empty-p push-name))
+               (not (wasabi--group-jid-p jid))
+               (not (equal (gethash jid wasabi--push-names-table) push-name)))
+      (puthash jid push-name wasabi--push-names-table)
+      (setq wasabi--jid-aliases-dirty t))))
+
+(defun wasabi--known-push-name (jid)
+  "Return the name JID goes by, as seen on their messages, or nil."
+  (when jid
+    (seq-some (lambda (variant)
+                (gethash variant wasabi--push-names-table))
+              (wasabi--jid-variants jid))))
+
+(defun wasabi--learn-from-message-info (p-info)
+  "Learn what a protocol message P-INFO says about who sent it.
 
 whatsmeow reports the sender's other addressing in SenderAlt and, for
-messages we sent, the peer's other addressing in RecipientAlt."
+messages we sent, the peer's other addressing in RecipientAlt, plus the
+name the sender goes by in PushName."
   (when p-info
+    ;; Our own name on our own messages says nothing about anyone else.
+    (unless (map-elt p-info 'IsFromMe)
+      (wasabi--learn-push-name (map-elt p-info 'Sender)
+                               (map-elt p-info 'PushName))
+      (wasabi--learn-push-name (map-elt p-info 'SenderAlt)
+                               (map-elt p-info 'PushName)))
     (let* ((chat (map-elt p-info 'Chat))
            (sender (map-elt p-info 'Sender))
            (sender-alt (map-elt p-info 'SenderAlt))
@@ -287,7 +322,7 @@ messages we sent, the peer's other addressing in RecipientAlt."
       learned)))
 
 (defun wasabi--jid-aliases-file ()
-  "Return the file caching learned JID pairings."
+  "Return the file caching what we have learned about who is who."
   (expand-file-name "jid-aliases.eld" (wasabi-data-dir)))
 
 (defun wasabi--save-jid-aliases ()
@@ -301,23 +336,38 @@ Callers save once per batch of learning rather than per pairing."
         (maphash (lambda (canonical members)
                    (push (cons canonical members) groups))
                  wasabi--jid-variants-table)
-        (with-temp-file (wasabi--jid-aliases-file)
-          (let ((print-length nil)
-                (print-level nil))
-            (prin1 groups (current-buffer))))))))
+        (let ((push-names '()))
+          (maphash (lambda (jid push-name)
+                     (push (cons jid push-name) push-names))
+                   wasabi--push-names-table)
+          (with-temp-file (wasabi--jid-aliases-file)
+            (let ((print-length nil)
+                  (print-level nil))
+              ;; Tagged, to tell it from the bare list of pairings
+              ;; written before push names were cached too.
+              (prin1 (list :aliases groups :push-names push-names)
+                     (current-buffer)))))))))
 
 (defun wasabi--load-jid-aliases ()
-  "Load cached JID pairings from disk."
+  "Load what we had learned about who is who from disk."
   (ignore-errors
     (when (file-exists-p (wasabi--jid-aliases-file))
-      (dolist (group (with-temp-buffer
+      (let* ((cached (with-temp-buffer
                        (insert-file-contents (wasabi--jid-aliases-file))
                        (read (current-buffer))))
-        (let ((canonical (car group))
-              (members (cdr group)))
-          (dolist (member members)
-            (puthash member canonical wasabi--jid-canonical-table))
-          (puthash canonical members wasabi--jid-variants-table))))))
+             ;; Files written before push names were cached hold the
+             ;; bare list of pairings.
+             (tagged (and (listp cached) (eq (car cached) :aliases)))
+             (groups (if tagged (plist-get cached :aliases) cached))
+             (push-names (and tagged (plist-get cached :push-names))))
+        (dolist (group groups)
+          (let ((canonical (car group))
+                (members (cdr group)))
+            (dolist (member members)
+              (puthash member canonical wasabi--jid-canonical-table))
+            (puthash canonical members wasabi--jid-variants-table)))
+        (dolist (entry push-names)
+          (puthash (car entry) (cdr entry) wasabi--push-names-table))))))
 
 (defun wasabi--find-contacts (jid contacts)
   "Return every CONTACTS entry addressing the same peer as JID.
@@ -357,7 +407,10 @@ only what they call themselves."
   (let ((entries (wasabi--find-contacts jid contacts)))
     (or (seq-some (lambda (contact) (map-elt contact :full-name)) entries)
         (wasabi--push-name
-         (seq-some (lambda (contact) (map-elt contact :push-name)) entries)))))
+         (or (seq-some (lambda (contact) (map-elt contact :push-name)) entries)
+             ;; WhatsApp knows no name for most contacts, so fall back to
+             ;; what this person has called themselves on their messages.
+             (wasabi--known-push-name jid))))))
 
 ;;; Timestamps
 
@@ -695,22 +748,26 @@ Invoke ON-FINISHED on success."
      :jids (seq-uniq (cons chat-jid (wasabi--jid-variants chat-jid)))
      :on-complete
      (lambda (p-messages)
-       (let ((p-messages (wasabi--dedupe-messages p-messages)))
+       (let* ((p-messages (wasabi--dedupe-messages p-messages))
+              (messages (wasabi-chat--parse-messages
+                         p-messages
+                         :chat-jid chat-jid
+                         :contact-name contact-name
+                         :contacts (map-elt (wasabi--state) :contacts))))
          (wasabi--log "Chat history for %s: %d messages"
                       chat-jid (length p-messages))
          (map-put! (wasabi--state) :chats
                    (map-insert (or (map-elt (wasabi--state) :chats) '())
                                chat-jid p-messages))
-         ;; Now that this chat's messages are known, the list can show
-         ;; when it really last saw one.
+         ;; Sorted oldest first, so the last of them dates the chat.  Its
+         ;; timestamp comes from the message's own Info where there is
+         ;; one, the only place the real time survives.
+         (wasabi--remember-chat-time chat-jid
+                                     (map-elt (car (last messages)) :timestamp))
          (wasabi--reparse-chat-index)
          (wasabi-chat--start
           :chat-jid chat-jid
-          :messages (wasabi-chat--parse-messages
-                     p-messages
-                     :chat-jid chat-jid
-                     :contact-name contact-name
-                     :contacts (map-elt (wasabi--state) :contacts))
+          :messages messages
           :contact-name contact-name))
        (when on-finished
          (funcall on-finished))))))
@@ -1030,8 +1087,10 @@ Calls ON-FAILURE with error if download fails."
                                ;; Learn this chat's LID/phone-number pairing before
                                ;; anything routes on the JID, or the message lands
                                ;; in a duplicate chat instead of the open one.
-                               (wasabi--learn-jid-aliases-from-info p-info)
+                               (wasabi--learn-from-message-info p-info)
                                (wasabi--save-jid-aliases)
+                               (wasabi--remember-chat-time
+                                chat-jid (map-elt p-info 'Timestamp))
                                ;; Trigger re-fetching index to show recent
                                ;; chats and groups with latest order.
                                (wasabi--send-chat-history-request :chat-jid "index")
@@ -1245,6 +1304,9 @@ The :connected flag tracks WhatsApp connection state (updated by notifications).
         ;;  ("987654321@g.us" . [...])
         ;;  ...)
         (cons :chats nil)
+        ;; When each chat last actually saw a message, read from the
+        ;; messages themselves rather than from when wuzapi wrote them.
+        (cons :chat-times nil)
         (cons :groups nil)
         ;; Set while a background re-fetch runs, so status changes do
         ;; not flash over the chat list.  Declared here because
@@ -1841,26 +1903,28 @@ Returns alist with :chat-jid, :canonical-jid, :alt-jids, :display-name,
           (cons :is-group (and is-group t))
           (cons :last-updated last-updated))))
 
-(defun wasabi--latest-message-timestamp (chat-jid chats)
-  "Return the newest message timestamp stored for CHAT-JID in CHATS, or nil.
+(defun wasabi--remember-chat-time (chat-jid timestamp)
+  "Record TIMESTAMP as when CHAT-JID last saw a message.
 
-The chat index only records when wuzapi last wrote the row, which after
-a first sync is the moment everything was backfilled rather than when
-each conversation last saw a message.  Where we have already fetched a
-chat's history, the messages themselves know better."
-  (when (and chat-jid chats)
-    (let ((newest nil))
-      (dolist (jid (seq-uniq (append (list chat-jid
-                                           (wasabi--normalize-jid chat-jid))
-                                     (wasabi--jid-variants chat-jid))))
-        (dolist (p-message (append (map-elt chats jid) nil))
-          (let ((timestamp (or (map-elt p-message 'timestamp)
-                               (map-elt p-message 'Timestamp)
-                               (map-elt p-message 'message_timestamp))))
-            (when (and timestamp
-                       (wasabi--timestamp-newer-p timestamp newest))
-              (setq newest timestamp)))))
-      newest)))
+Only if it is more recent than what we had: a chat is dated by its
+newest message, and messages do not arrive in order."
+  (when (and chat-jid timestamp (wasabi--parse-timestamp timestamp))
+    (let ((jid (wasabi--canonical-jid chat-jid)))
+      (when (wasabi--timestamp-newer-p
+             timestamp (map-elt (map-elt (wasabi--state) :chat-times) jid))
+        (map-put! (wasabi--state) :chat-times
+                  (map-insert (or (map-elt (wasabi--state) :chat-times) '())
+                              jid timestamp))))))
+
+(defun wasabi--latest-message-timestamp (chat-jid times)
+  "Return when CHAT-JID last saw a message, per TIMES, or nil.
+
+Neither the chat index nor wuzapi's message rows can say: both record
+when wuzapi wrote them, which after a sync is the moment everything was
+backfilled.  The real time is inside each message, so it is taken from
+there as histories load and remembered here."
+  (when (and chat-jid times)
+    (map-elt times (wasabi--canonical-jid chat-jid))))
 
 (defun wasabi--reparse-chat-index ()
   "Read the stored chat index again and refresh the display.
@@ -1872,14 +1936,14 @@ index is read again rather than refetched."
                         p-chat-index
                         (map-elt (wasabi--state) :contacts)
                         (map-elt (wasabi--state) :groups)
-                        (map-elt (wasabi--state) :chats))))
+                        (map-elt (wasabi--state) :chat-times))))
       (map-put! (wasabi--state) :chats-index chats-index)
       (wasabi--log "Loaded chat index: %d chats (%d dated by their messages)"
                    (length chats-index)
                    (seq-count (lambda (chat)
                                 (wasabi--latest-message-timestamp
                                  (map-elt chat :chat-jid)
-                                 (map-elt (wasabi--state) :chats)))
+                                 (map-elt (wasabi--state) :chat-times)))
                               chats-index))
       (wasabi--refresh))))
 
@@ -2300,8 +2364,9 @@ bug report."
                         (map-nested-elt state '(:status :type))
                         (if (map-elt state :connected) "yes" "no")
                         (or (map-elt state :syncing) "no")))
-        (insert (format "JID pairings learned: %d\n\n"
-                        (hash-table-count wasabi--jid-canonical-table)))
+        (insert (format "JID pairings learned: %d   push names learned: %d\n\n"
+                        (hash-table-count wasabi--jid-canonical-table)
+                        (hash-table-count wasabi--push-names-table)))
 
         (insert (format "Contacts: %d\n" (length contacts)))
         (insert (format "  with a saved name: %d\n"
@@ -2320,6 +2385,11 @@ bug report."
         (insert (format "Chat index: %d\n" (length index)))
         (insert (format "  named:             %d\n"
                         (seq-count (lambda (chat) (map-elt chat :named)) index)))
+        (insert (format "  named with a ~:    %d\n"
+                        (seq-count (lambda (chat)
+                                     (string-prefix-p
+                                      "~" (or (map-elt chat :display-name) "")))
+                                   index)))
         (insert (format "  showing a raw JID: %d\n"
                         (seq-count (lambda (chat)
                                      (not (map-elt chat :named)))
@@ -2335,7 +2405,8 @@ bug report."
         (insert (format "  dated by messages: %d\n"
                         (seq-count (lambda (chat)
                                      (wasabi--latest-message-timestamp
-                                      (map-elt chat :chat-jid) chats))
+                                      (map-elt chat :chat-jid)
+                                      (map-elt state :chat-times)))
                                    index)))
         ;; One distinct value means every row was written by the same
         ;; sync, which is why they all claim the same time.
@@ -2378,8 +2449,9 @@ bug report."
                                          messages)
                               (length messages)))
               (insert (format "    newest: %s\n"
-                              (or (wasabi--latest-message-timestamp (car chat) chats)
-                                  "none readable"))))))
+                              (or (wasabi--latest-message-timestamp
+                                   (car chat) (map-elt state :chat-times))
+                                  "not recorded"))))))
         (goto-char (point-min))
         (special-mode)))
     (switch-to-buffer buffer)))

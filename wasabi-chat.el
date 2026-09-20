@@ -49,7 +49,7 @@
 (declare-function wasabi--group-jid-p "wasabi")
 (declare-function wasabi--jid-identifier "wasabi")
 (declare-function wasabi--jid-string "wasabi")
-(declare-function wasabi--learn-jid-aliases-from-info "wasabi")
+(declare-function wasabi--learn-from-message-info "wasabi")
 (declare-function wasabi--parse-timestamp "wasabi")
 (declare-function wasabi--push-name "wasabi")
 (declare-function wasabi--save-jid-aliases "wasabi")
@@ -228,7 +228,7 @@ REACTIONS is a hash table of message-id -> list of reactions."
           ;; Stored history carries the same Info as a live event, so use
           ;; it to learn LID/phone-number pairings for chats we have not
           ;; seen a message in yet.
-          (wasabi--learn-jid-aliases-from-info (map-elt p-data 'Info))
+          (wasabi--learn-from-message-info (map-elt p-data 'Info))
           ;; Skip reaction messages - they're already in reactions.
           (unless (map-nested-elt p-data '(Message reactionMessage))
             (let* ((p-sender-jid (map-nested-elt p-data '(Info Sender)))
