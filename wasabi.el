@@ -319,23 +319,45 @@ Callers save once per batch of learning rather than per pairing."
             (puthash member canonical wasabi--jid-canonical-table))
           (puthash canonical members wasabi--jid-variants-table))))))
 
-(defun wasabi--find-contact (jid contacts)
-  "Look up JID in CONTACTS, trying every known JID variant.
+(defun wasabi--find-contacts (jid contacts)
+  "Return every CONTACTS entry addressing the same peer as JID.
 
 Contacts are keyed by whichever JID WhatsApp happened to store, which
-is often not the one a chat or an event uses."
+is often not the one a chat or an event uses; and the same person can
+hold an entry under each of their JIDs, only one of which carries the
+name we saved for them."
   (when-let ((jid (wasabi--jid-string jid)))
     (when contacts
-      (or (map-elt contacts (intern jid))
-          (seq-some (lambda (variant)
-                      (map-elt contacts (intern variant)))
-                    (wasabi--jid-variants jid))))))
+      (delq nil
+            (seq-uniq
+             (cons (map-elt contacts (intern jid))
+                   (mapcar (lambda (variant)
+                             (map-elt contacts (intern variant)))
+                           (wasabi--jid-variants jid))))))))
+
+(defun wasabi--push-name (push-name)
+  "Return PUSH-NAME marked as a push name, or nil if there is none.
+
+WhatsApp prefixes a name its owner chose with \"~\", distinguishing it
+from one we saved ourselves."
+  (when (and push-name
+             (stringp push-name)
+             (not (string-empty-p push-name)))
+    (if (string-prefix-p "~" push-name)
+        push-name
+      (concat "~" push-name))))
 
 (defun wasabi--contact-display-name (jid contacts)
-  "Return the best known name for JID in CONTACTS, or nil."
-  (when-let ((contact (wasabi--find-contact jid contacts)))
-    (or (map-elt contact :full-name)
-        (map-elt contact :push-name))))
+  "Return the best known name for JID in CONTACTS, or nil.
+
+A name we saved wins over a push name even when the two are filed
+under different JIDs for the same person, which is the usual case: the
+phone number entry carries the saved name and the LID entry carries
+only what they call themselves."
+  (let ((entries (wasabi--find-contacts jid contacts)))
+    (or (seq-some (lambda (contact) (map-elt contact :full-name)) entries)
+        (wasabi--push-name
+         (seq-some (lambda (contact) (map-elt contact :push-name)) entries)))))
 
 ;;; Timestamps
 
@@ -666,20 +688,86 @@ Invoke ON-FINISHED on success."
     (error "Not in a chats buffer"))
   (unless chat-jid
     (error ":chat-jid is required"))
+  (if (equal chat-jid "index")
+      (wasabi--send-chat-index-request :on-finished on-finished)
+    (wasabi--fetch-chat-messages
+     ;; One conversation can be recorded under both a LID and a phone
+     ;; number JID, and wuzapi keeps a separate history under each, so
+     ;; gather the messages from every JID that addresses this chat.
+     :jids (seq-uniq (cons chat-jid (wasabi--jid-variants chat-jid)))
+     :on-complete
+     (lambda (p-messages)
+       (let ((p-messages (wasabi--dedupe-messages p-messages)))
+         (wasabi--log "Chat history for %s: %d messages"
+                      chat-jid (length p-messages))
+         (map-put! (wasabi--state) :chats
+                   (map-insert (or (map-elt (wasabi--state) :chats) '())
+                               chat-jid p-messages))
+         (wasabi-chat--start
+          :chat-jid chat-jid
+          :messages (wasabi-chat--parse-messages
+                     p-messages
+                     :chat-jid chat-jid
+                     :contact-name contact-name
+                     :contacts (map-elt (wasabi--state) :contacts))
+          :contact-name contact-name))
+       (when on-finished
+         (funcall on-finished))))))
+
+(cl-defun wasabi--fetch-chat-messages (&key jids acc on-complete)
+  "Fetch the messages stored under each of JIDS.
+
+Calls ON-COMPLETE with every message gathered, accumulated in ACC.  A
+JID whose history cannot be fetched is logged and skipped rather than
+losing the rest."
+  (if (null jids)
+      (funcall on-complete acc)
+    (let ((jid (car jids)))
+      (acp-send-request
+       :client (map-elt (wasabi--state) :client)
+       :request (wasabi--make-chat-history-request
+                 :token wasabi-user-token
+                 :chat-jid jid)
+       :on-success (lambda (response)
+                     (wasabi--fetch-chat-messages
+                      :jids (cdr jids)
+                      :acc (append acc (append response nil))
+                      :on-complete on-complete))
+       :on-failure (lambda (error)
+                     (wasabi--log "Failed to fetch chat history for %s: %s"
+                                  jid (or (map-elt error 'message) "unknown"))
+                     (wasabi--fetch-chat-messages
+                      :jids (cdr jids)
+                      :acc acc
+                      :on-complete on-complete))))))
+
+(defun wasabi--dedupe-messages (p-messages)
+  "Drop P-MESSAGES that repeat a message_id, keeping the first seen.
+
+Gathering a chat from several JIDs can turn up the same message twice."
+  (let ((seen (make-hash-table :test 'equal))
+        (kept '()))
+    (dolist (p-message (append p-messages nil))
+      (let ((id (map-elt p-message 'message_id)))
+        (unless (and id (gethash id seen))
+          (when id (puthash id t seen))
+          (push p-message kept))))
+    (nreverse kept)))
+
+(cl-defun wasabi--send-chat-index-request (&key on-finished)
+  "Fetch the chat index and store it in state as :chats-index.
+
+Invoke ON-FINISHED when done."
   (acp-send-request :client (map-elt (wasabi--state) :client)
                     :request (wasabi--make-chat-history-request
                               :token wasabi-user-token
-                              :chat-jid chat-jid)
+                              :chat-jid "index")
                     :on-success (lambda (response)
-                                  (wasabi--log "Chat history response for %s: type=%s length=%s"
-                                               chat-jid
-                                               (type-of response)
-                                               (if (listp response) (length response) "N/A"))
                                   (cond
                                    ;; Handle "index" response: {"user-id": [...]} from backend
                                    ;; Backend returns map of user-id to chat arrays
                                    ;; Merge all users' chats (typically only one user)
-                                   ((and (equal chat-jid "index") response)
+                                   (response
                                     (let* (;; Join all the chats into a single list.
                                            ;;
                                            ;;'((user-123 . [((chat_jid . "123") (last_updated . "2025-11-19"))
@@ -703,34 +791,12 @@ Invoke ON-FINISHED on success."
                                       (wasabi--log "Raw chats from response: %d" (length p-chats))
                                       (map-put! (wasabi--state) :chats-index chats-index)
                                       (wasabi--log "Loaded chat index: %d chats" (length chats-index))
-                                      (wasabi--refresh)))
-                                   ;; Handle specific chat response: [message-array]
-                                   ;; Store as alist entry: (chat-jid . p-messages)
-                                   (response
-                                    (map-put! (wasabi--state) :chats
-                                              (map-insert (or (map-elt (wasabi--state) :chats) '())
-                                                          chat-jid response))
-                                    ;; Parse protocol messages to internal format
-                                    ;; and hand them to the chat buffer, which
-                                    ;; owns buffer creation and reuse.
-                                    (wasabi-chat--start
-                                     :chat-jid chat-jid
-                                     :messages (wasabi-chat--parse-messages
-                                                response
-                                                :chat-jid chat-jid
-                                                :contact-name contact-name
-                                                :contacts (map-elt (wasabi--state) :contacts))
-                                     :contact-name contact-name))
-                                   ((and chat-jid (not (equal chat-jid "index")))
-                                    ;; Not an "index" request.
-                                    ;; Start new chat (no history).
-                                    (wasabi-chat--start :chat-jid chat-jid
-                                                        :messages nil ;; no history.
-                                                        :contact-name contact-name)))
+                                      (wasabi--refresh))))
                                   (when on-finished
                                     (funcall on-finished)))
                     :on-failure (lambda (error)
-                                  (wasabi--log "Failed to fetch chat history for %s: %s" chat-jid (or (map-elt error 'message) "unknown"))
+                                  (wasabi--log "Failed to fetch chat index: %s"
+                                               (or (map-elt error 'message) "unknown"))
                                   (message "Failed to fetch chat history"))))
 
 (cl-defun wasabi--send-chat-send-text-request (&key phone body on-success on-failure)

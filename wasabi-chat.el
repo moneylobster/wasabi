@@ -51,6 +51,7 @@
 (declare-function wasabi--jid-string "wasabi")
 (declare-function wasabi--learn-jid-aliases-from-info "wasabi")
 (declare-function wasabi--parse-timestamp "wasabi")
+(declare-function wasabi--push-name "wasabi")
 (declare-function wasabi--save-jid-aliases "wasabi")
 (declare-function wasabi--same-chat-p "wasabi")
 (declare-function wasabi--timestamp-older-p "wasabi")
@@ -250,8 +251,7 @@ CONTACT-NAME is an optional fallback name."
       ;; whichever addressing WhatsApp stored, not necessarily the
       ;; sender's.
       (wasabi--contact-display-name p-sender-jid contacts)
-      (let ((push-name (map-nested-elt p-data '(Info PushName))))
-        (and push-name (not (string-empty-p push-name)) push-name))
+      (wasabi--push-name (map-nested-elt p-data '(Info PushName)))
       ;; The chat's own name only names the sender one to one.  In a
       ;; group it is the group's name, not a participant's.
       (and contact-name
@@ -328,7 +328,7 @@ For reaction messages, also includes :is-reaction, :target-id and :emoji."
               ;; Resolved across every known JID variant: a sender can be
               ;; addressed differently to the contact we have stored.
               (wasabi--contact-display-name sender-jid contacts)
-              (and push-name (not (string-empty-p push-name)) push-name)
+              (wasabi--push-name push-name)
               ;; The chat's own name only names the sender one to one.  In
               ;; a group it is the group's name, not a participant's.
               (and (not is-group) contact-name)
