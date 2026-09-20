@@ -33,7 +33,14 @@
 (eval-when-compile
   (require 'cl-lib))
 (require 'map)
+(require 'parse-time)
 (require 'seq)
+
+(defgroup wasabi nil
+  "A native Emacs interface for WhatsApp messaging."
+  :group 'comm
+  :prefix "wasabi-")
+
 (require 'wasabi-chat)
 (require 'wasabi-icon)
 (require 'wasabi-notifications)
@@ -147,6 +154,242 @@ it is required internally by the process.")
     "AppStateSyncComplete")
   "WhatsApp event types to subscribe to during connection.")
 
+
+;;; Chat identity (JIDs)
+;;
+;; WhatsApp addresses the same person two ways: by phone number
+;; ("447123456789@s.whatsapp.net", a "PN" JID) and by linked identity
+;; ("123456789@lid", a "LID" JID).  Which one shows up depends on the
+;; chat's addressing mode, so the chat index, the contact list and
+;; incoming events routinely disagree about a contact's JID.  Left
+;; unreconciled, one person shows up as two chats: messages sent to one
+;; JID come back addressed to the other.
+;;
+;; whatsmeow reports the counterpart JID on message events (Info's
+;; SenderAlt and RecipientAlt), so we learn the pairing as messages flow
+;; through and canonicalise every JID we display, route or send to.
+;; Pairings are cached on disk, so this survives restarts.
+
+(defvar wasabi--jid-canonical-table (make-hash-table :test 'equal)
+  "Map of known JID to the canonical JID addressing the same peer.")
+
+(defvar wasabi--jid-variants-table (make-hash-table :test 'equal)
+  "Map of canonical JID to all JIDs known to address the same peer.")
+
+(defvar wasabi--jid-aliases-dirty nil
+  "Non-nil when learned JID pairings have yet to be written to disk.")
+
+(defun wasabi--jid-string (jid)
+  "Return JID as a non-empty string, or nil.
+
+Protocol JIDs are usually strings, but arrive as symbols when they
+were read as JSON object keys."
+  (cond ((null jid) nil)
+        ((stringp jid) (unless (string-empty-p jid) jid))
+        ((symbolp jid) (symbol-name jid))
+        (t (format "%s" jid))))
+
+(defun wasabi--normalize-jid (jid)
+  "Return JID without its device and agent suffixes.
+
+\"447123456789:12@s.whatsapp.net\" => \"447123456789@s.whatsapp.net\"."
+  (when-let ((jid (wasabi--jid-string jid)))
+    (if (string-match "\\`\\([^@:.]+\\)[^@]*@\\(.+\\)\\'" jid)
+        (concat (match-string 1 jid) "@" (downcase (match-string 2 jid)))
+      jid)))
+
+(defun wasabi--jid-identifier (jid)
+  "Return the user part of JID (everything before the \"@\")."
+  (when-let ((jid (wasabi--jid-string jid)))
+    (if (string-match "\\`\\([^@]+\\)@" jid)
+        (match-string 1 jid)
+      jid)))
+
+(defun wasabi--group-jid-p (jid)
+  "Return non-nil if JID addresses a group."
+  (when-let ((jid (wasabi--jid-string jid)))
+    (string-suffix-p "@g.us" jid)))
+
+(defun wasabi--jid-rank (jid)
+  "Rank JID as a canonical candidate.  Lower sorts first.
+
+Phone number JIDs win: that is what the send API expects and what
+users recognise."
+  (cond ((string-suffix-p "@s.whatsapp.net" jid) 0)
+        ((string-suffix-p "@lid" jid) 1)
+        (t 2)))
+
+(defun wasabi--canonical-jid (jid)
+  "Return the canonical JID for JID.
+
+Falls back to JID itself when no counterpart is known."
+  (when-let ((jid (wasabi--normalize-jid jid)))
+    (or (gethash jid wasabi--jid-canonical-table) jid)))
+
+(defun wasabi--jid-variants (jid)
+  "Return every JID known to address the same peer as JID."
+  (when-let ((canonical (wasabi--canonical-jid jid)))
+    (or (gethash canonical wasabi--jid-variants-table)
+        (list canonical))))
+
+(defun wasabi--same-chat-p (jid-a jid-b)
+  "Return non-nil when JID-A and JID-B address the same chat."
+  (let ((a (wasabi--canonical-jid jid-a))
+        (b (wasabi--canonical-jid jid-b)))
+    (and a b (equal a b))))
+
+(defun wasabi--learn-jid-alias (jid-a jid-b)
+  "Record that JID-A and JID-B address the same peer.
+
+Return non-nil when this taught us something new."
+  (let ((a (wasabi--normalize-jid jid-a))
+        (b (wasabi--normalize-jid jid-b)))
+    (when (and a b
+               (not (equal a b))
+               ;; Group JIDs have no counterpart: only participants do.
+               (not (wasabi--group-jid-p a))
+               (not (wasabi--group-jid-p b))
+               (not (wasabi--same-chat-p a b)))
+      (let* ((members (seq-uniq (append (wasabi--jid-variants a)
+                                        (wasabi--jid-variants b))))
+             (canonical (car (sort (copy-sequence members)
+                                   (lambda (x y)
+                                     (< (wasabi--jid-rank x)
+                                        (wasabi--jid-rank y)))))))
+        (dolist (member members)
+          ;; Superseded canonicals must not keep a variant list of their own.
+          (remhash member wasabi--jid-variants-table)
+          (puthash member canonical wasabi--jid-canonical-table))
+        (puthash canonical members wasabi--jid-variants-table)
+        (wasabi--log "Learned JID alias: %s" (string-join members " = "))
+        (setq wasabi--jid-aliases-dirty t)))))
+
+(defun wasabi--learn-jid-aliases-from-info (p-info)
+  "Learn JID pairings from a protocol message P-INFO.
+
+whatsmeow reports the sender's other addressing in SenderAlt and, for
+messages we sent, the peer's other addressing in RecipientAlt."
+  (when p-info
+    (let* ((chat (map-elt p-info 'Chat))
+           (sender (map-elt p-info 'Sender))
+           (sender-alt (map-elt p-info 'SenderAlt))
+           (recipient-alt (map-elt p-info 'RecipientAlt))
+           (is-group (or (map-elt p-info 'IsGroup)
+                         (wasabi--group-jid-p chat)))
+           (learned (wasabi--learn-jid-alias sender sender-alt)))
+      ;; In a one-to-one chat the chat JID is the peer, so the peer's
+      ;; alternative addressing applies to the chat itself.
+      (unless is-group
+        (setq learned (or (wasabi--learn-jid-alias
+                           chat
+                           (if (map-elt p-info 'IsFromMe) recipient-alt sender-alt))
+                          learned)))
+      learned)))
+
+(defun wasabi--jid-aliases-file ()
+  "Return the file caching learned JID pairings."
+  (expand-file-name "jid-aliases.eld" (wasabi-data-dir)))
+
+(defun wasabi--save-jid-aliases ()
+  "Persist learned JID pairings to disk, if any are outstanding.
+
+Callers save once per batch of learning rather than per pairing."
+  (when wasabi--jid-aliases-dirty
+    (setq wasabi--jid-aliases-dirty nil)
+    (ignore-errors
+      (let ((groups '()))
+        (maphash (lambda (canonical members)
+                   (push (cons canonical members) groups))
+                 wasabi--jid-variants-table)
+        (with-temp-file (wasabi--jid-aliases-file)
+          (let ((print-length nil)
+                (print-level nil))
+            (prin1 groups (current-buffer))))))))
+
+(defun wasabi--load-jid-aliases ()
+  "Load cached JID pairings from disk."
+  (ignore-errors
+    (when (file-exists-p (wasabi--jid-aliases-file))
+      (dolist (group (with-temp-buffer
+                       (insert-file-contents (wasabi--jid-aliases-file))
+                       (read (current-buffer))))
+        (let ((canonical (car group))
+              (members (cdr group)))
+          (dolist (member members)
+            (puthash member canonical wasabi--jid-canonical-table))
+          (puthash canonical members wasabi--jid-variants-table))))))
+
+(defun wasabi--find-contact (jid contacts)
+  "Look up JID in CONTACTS, trying every known JID variant.
+
+Contacts are keyed by whichever JID WhatsApp happened to store, which
+is often not the one a chat or an event uses."
+  (when-let ((jid (wasabi--jid-string jid)))
+    (when contacts
+      (or (map-elt contacts (intern jid))
+          (seq-some (lambda (variant)
+                      (map-elt contacts (intern variant)))
+                    (wasabi--jid-variants jid))))))
+
+(defun wasabi--contact-display-name (jid contacts)
+  "Return the best known name for JID in CONTACTS, or nil."
+  (when-let ((contact (wasabi--find-contact jid contacts)))
+    (or (map-elt contact :full-name)
+        (map-elt contact :push-name))))
+
+;;; Timestamps
+
+(defun wasabi--parse-timestamp (timestamp)
+  "Parse protocol TIMESTAMP into an Emacs time value, or nil.
+
+Handles both ISO 8601 (\"2025-11-11T12:00:00Z\", used by message
+events) and Go's default time format (\"2025-11-11 12:00:00.000000
++0000 GMT\", used by the chat index)."
+  (when (and (stringp timestamp)
+             (not (string-empty-p timestamp)))
+    (or (ignore-errors (parse-iso8601-time-string timestamp))
+        (ignore-errors
+          (let ((parsed (parse-time-string timestamp)))
+            (when (and (decoded-time-year parsed)
+                       (decoded-time-month parsed)
+                       (decoded-time-day parsed))
+              (encode-time (decoded-time-set-defaults parsed))))))))
+
+(defun wasabi--timestamp-newer-p (a b)
+  "Return non-nil when timestamp A is more recent than timestamp B.
+
+Missing or unparseable timestamps sort last."
+  (let ((ta (wasabi--parse-timestamp a))
+        (tb (wasabi--parse-timestamp b)))
+    (cond ((and ta tb) (time-less-p tb ta))
+          (ta t)
+          (t nil))))
+
+(defun wasabi--timestamp-older-p (a b)
+  "Return non-nil when timestamp A precedes timestamp B.
+
+Missing or unparseable timestamps sort last."
+  (let ((ta (wasabi--parse-timestamp a))
+        (tb (wasabi--parse-timestamp b)))
+    (cond ((and ta tb) (time-less-p ta tb))
+          (ta t)
+          (t nil))))
+
+(defun wasabi--chat-display-name (chat-jid)
+  "Return the best known display name for CHAT-JID, or nil.
+
+Looks in the chat index first, so a chat keeps the name it is listed
+under, then falls back to the group and contact lists."
+  (when-let ((chat-jid (wasabi--jid-string chat-jid)))
+    (or (seq-some (lambda (chat)
+                    (when (wasabi--same-chat-p (map-elt chat :chat-jid) chat-jid)
+                      (map-elt chat :display-name)))
+                  (map-elt (wasabi--state) :chats-index))
+        (if (wasabi--group-jid-p chat-jid)
+            (map-nested-elt (map-elt (wasabi--state) :groups)
+                            (list (intern (wasabi--normalize-jid chat-jid)) :name))
+          (wasabi--contact-display-name chat-jid (map-elt (wasabi--state) :contacts))))))
+
 (defvar-local wasabi--state nil)
 
 (cl-defun wasabi--initialize (&key wasabi-buffer status-type status-message)
@@ -186,6 +429,7 @@ For silent progression, set :silent-refresh in state before calling."
                                        :environment-variables (list (concat "WUZAPI_ADMIN_TOKEN=" wasabi--admin-token)
                                                                     (concat "TZ=" (wasabi--timezone)))
                                        :context-buffer wasabi-buffer))
+    (wasabi--load-jid-aliases)
     (wasabi--initialize-subscriptions)
     (wasabi--initialize :wasabi-buffer wasabi-buffer
                         :status-type 'check-user
@@ -467,22 +711,16 @@ Invoke ON-FINISHED on success."
                                               (map-insert (or (map-elt (wasabi--state) :chats) '())
                                                           chat-jid response))
                                     ;; Parse protocol messages to internal format
-                                    (let ((messages (wasabi-chat--parse-messages response
-                                                                                 :chat-jid chat-jid
-                                                                                 :contact-name contact-name
-                                                                                 :contacts (map-elt (wasabi--state) :contacts)))
-                                          ;; TODO: Consolidate buffer creation logic.
-                                          (chat-buffer (get-buffer (format "*Wasabi: %s*" (or contact-name chat-jid)))))
-                                      (if chat-buffer
-                                          ;; Buffer exists, just refresh it
-                                          (progn
-                                            (with-current-buffer chat-buffer
-                                              (wasabi-chat--refresh messages))
-                                            (switch-to-buffer chat-buffer))
-                                        ;; Buffer doesn't exist, start new chat
-                                        (wasabi-chat--start :chat-jid chat-jid
-                                                            :messages messages
-                                                            :contact-name contact-name))))
+                                    ;; and hand them to the chat buffer, which
+                                    ;; owns buffer creation and reuse.
+                                    (wasabi-chat--start
+                                     :chat-jid chat-jid
+                                     :messages (wasabi-chat--parse-messages
+                                                response
+                                                :chat-jid chat-jid
+                                                :contact-name contact-name
+                                                :contacts (map-elt (wasabi--state) :contacts))
+                                     :contact-name contact-name))
                                    ((and chat-jid (not (equal chat-jid "index")))
                                     ;; Not an "index" request.
                                     ;; Start new chat (no history).
@@ -690,31 +928,44 @@ Calls ON-FAILURE with error if download fails."
                             ((equal (map-elt notification 'method) "Message")
                              (let* ((p-message (map-nested-elt notification '(params event Message)))
                                     (p-info (map-nested-elt notification '(params event Info)))
-                                    (chat-jid (if (symbolp (map-elt p-info 'Chat))
-                                                  (symbol-name (map-elt p-info 'Chat))
-                                                (map-elt p-info 'Chat)))
+                                    (chat-jid (wasabi--jid-string (map-elt p-info 'Chat)))
                                     ;; Must capture contacts before with-current-buffer.
                                     (contacts (map-elt (wasabi--state) :contacts)))
+                               ;; Learn this chat's LID/phone-number pairing before
+                               ;; anything routes on the JID, or the message lands
+                               ;; in a duplicate chat instead of the open one.
+                               (wasabi--learn-jid-aliases-from-info p-info)
+                               (wasabi--save-jid-aliases)
                                ;; Trigger re-fetching index to show recent
                                ;; chats and groups with latest order.
                                (wasabi--send-chat-history-request :chat-jid "index")
-                               (dolist (buffer (buffer-list))
-                                 (with-current-buffer buffer
-                                   (when-let ((message (and (derived-mode-p 'wasabi-chat-mode)
-                                                            (equal (map-elt wasabi-chat--chat :chat-jid) chat-jid)
-                                                            (wasabi-chat--parse-notification
-                                                             :p-message p-message
-                                                             :p-info p-info
-                                                             :contact-name (map-elt wasabi-chat--chat :contact-name)
-                                                             :chat-jid chat-jid
-                                                             :contacts contacts))))
-									 (wasabi--notify message)
-                                     (if (map-elt message :is-reaction)
-                                         (wasabi-chat--add-reaction
-                                          :target-id (map-elt message :target-id)
-                                          :emoji (map-elt message :emoji)
-                                          :sender (map-elt message :sender-name))
-                                       (wasabi-chat--append-message message)))))))
+                               (let* ((chat-buffer (wasabi-chat--find-buffer chat-jid))
+                                      (contact-name
+                                       (or (when chat-buffer
+                                             (map-elt (buffer-local-value 'wasabi-chat--chat
+                                                                          chat-buffer)
+                                                      :contact-name))
+                                           (wasabi--chat-display-name chat-jid)))
+                                      (parsed (wasabi-chat--parse-notification
+                                               :p-message p-message
+                                               :p-info p-info
+                                               :contact-name contact-name
+                                               :chat-jid chat-jid
+                                               :contacts contacts)))
+                                 (when parsed
+                                   ;; Notify whether or not the chat is open, but
+                                   ;; never for our own messages, which echo back
+                                   ;; from other devices.
+                                   (unless (map-elt p-info 'IsFromMe)
+                                     (wasabi--notify parsed :chat-buffer chat-buffer))
+                                   (when chat-buffer
+                                     (with-current-buffer chat-buffer
+                                       (if (map-elt parsed :is-reaction)
+                                           (wasabi-chat--add-reaction
+                                            :target-id (map-elt parsed :target-id)
+                                            :emoji (map-elt parsed :emoji)
+                                            :sender (map-elt parsed :sender-name))
+                                         (wasabi-chat--append-message parsed))))))))
                             ((equal (map-elt notification 'method) "HistorySync")
                              (wasabi--log "HistorySync received")
                              (wasabi--log "HistorySync: current-buffer=%s, major-mode=%s" (current-buffer) major-mode)
@@ -1094,6 +1345,55 @@ Error if not found."
   (let ((current-prefix-arg t))
     (call-interactively #'wasabi-new-chat)))
 
+(defun wasabi--chat-index-jid-p (jid chats-index)
+  "Return non-nil when JID is a JID CHATS-INDEX already uses."
+  (let ((jid (wasabi--normalize-jid jid)))
+    (seq-some (lambda (chat)
+                (or (equal (wasabi--normalize-jid (map-elt chat :chat-jid)) jid)
+                    (seq-find (lambda (alt)
+                                (equal (wasabi--normalize-jid alt) jid))
+                              (map-elt chat :alt-jids))))
+              chats-index)))
+
+(defun wasabi--dedupe-contact-entries (entries chats-index)
+  "Drop ENTRIES addressing a peer already covered by an earlier entry.
+
+The contact list can hold the same person under both a LID and a phone
+number JID.  Offering both means picking one starts a second chat
+alongside the existing one, so keep a single entry and prefer the JID
+CHATS-INDEX already uses."
+  (let ((seen (make-hash-table :test 'equal))
+        (kept '()))
+    (dolist (entry entries)
+      (let* ((jid (map-elt entry :jid))
+             (canonical (wasabi--canonical-jid jid))
+             (existing (gethash canonical seen)))
+        (cond
+         ((null existing)
+          (puthash canonical entry seen)
+          (push entry kept))
+         ((and (wasabi--chat-index-jid-p jid chats-index)
+               (not (wasabi--chat-index-jid-p (map-elt existing :jid) chats-index)))
+          (map-put! existing :jid jid)))))
+    (nreverse kept)))
+
+(defun wasabi--disambiguate-entries (entries)
+  "Make the display names in ENTRIES unique, and return ENTRIES.
+
+`completing-read' hands back a label, so two people sharing a name
+would always resolve to whichever of them came first."
+  (let ((counts (make-hash-table :test 'equal)))
+    (dolist (entry entries)
+      (puthash (map-elt entry :display-name)
+               (1+ (gethash (map-elt entry :display-name) counts 0))
+               counts))
+    (dolist (entry entries entries)
+      (when (> (gethash (map-elt entry :display-name) counts 0) 1)
+        (map-put! entry :display-name
+                  (format "%s <%s>"
+                          (map-elt entry :display-name)
+                          (wasabi--jid-identifier (map-elt entry :jid))))))))
+
 (defun wasabi-new-chat (new-number)
   "Select a contact or group and open a new chat.
 
@@ -1105,7 +1405,7 @@ With prefix argument NEW-NUMBER, prompt for a phone number."
     (if new-number
         ;; Direct phone number chat
         (wasabi--send-chat-history-request
-         :chat-jid (concat new-number "@s.whatsapp.net")
+         :chat-jid (concat (string-trim new-number) "@s.whatsapp.net")
          :contact-name (string-trim new-number))
       ;; Normal contact/group selection
       (unless (or (map-elt (wasabi--state) :contacts)
@@ -1135,15 +1435,24 @@ With prefix argument NEW-NUMBER, prompt for a phone number."
                             (:is-group . t))))
                       (map-elt (wasabi--state) :groups)))
              (all-entries
-              (sort
-               (seq-filter
-                (lambda (entry)
-                  ;; Filter out unknown groups or numbers
-                  (and (not (string-suffix-p "@lid" (map-elt entry :display-name)))
-                       (not (string-suffix-p "@g.us" (map-elt entry :display-name)))))
-                (append contact-entries group-entries))
-               (lambda (a b) (string< (map-elt a :display-name) (map-elt b :display-name)))))
-             (max-width (apply #'max (mapcar (lambda (entry) (string-width (map-elt entry :display-name))) all-entries)))
+              (wasabi--disambiguate-entries
+               (wasabi--dedupe-contact-entries
+                (sort
+                 (seq-filter
+                  (lambda (entry)
+                    ;; Filter out groups and numbers we couldn't name: their
+                    ;; display name is the raw JID, no use to pick from.
+                    (not (and (equal (map-elt entry :display-name) (map-elt entry :jid))
+                              (or (string-suffix-p "@lid" (map-elt entry :jid))
+                                  (string-suffix-p "@g.us" (map-elt entry :jid))))))
+                  (append contact-entries group-entries))
+                 (lambda (a b) (string< (map-elt a :display-name) (map-elt b :display-name))))
+                (map-elt (wasabi--state) :chats-index))))
+             (max-width (if all-entries
+                            (apply #'max (mapcar (lambda (entry)
+                                                   (string-width (map-elt entry :display-name)))
+                                                 all-entries))
+                          0))
              (candidates
               (mapcar (lambda (entry)
                         ;; return list of (label . jid)
@@ -1155,6 +1464,8 @@ With prefix argument NEW-NUMBER, prompt for a phone number."
                                 (map-elt entry :display-name))
                               (map-elt entry :jid)))
                       all-entries)))
+        (unless all-entries
+          (user-error "No contacts or groups available"))
         (if-let* ((selected-label (completing-read "Chat with: " candidates nil t))
                   (selected-jid (map-elt candidates selected-label))
                   (selected-entry (seq-find (lambda (entry)
@@ -1162,9 +1473,9 @@ With prefix argument NEW-NUMBER, prompt for a phone number."
                                             all-entries)))
             (wasabi--send-chat-history-request
              :chat-jid selected-jid
-             :contact-name (concat (map-elt selected-entry :display-name)
-                                   (when (map-elt selected-entry :is-group)
-                                     " (group)")))
+             ;; No " (group)" suffix here: the chat list opens the same chat
+             ;; without one, and a differing name used to mean a second buffer.
+             :contact-name (map-elt selected-entry :display-name))
           (user-error "No contact or group found"))))))
 
 (defun wasabi-open-data-directory ()
@@ -1218,10 +1529,7 @@ Returns list of (date-label . chats-for-that-date)."
         (today (decode-time))
         (yesterday (decode-time (time-subtract nil (* 24 60 60)))))
     (dolist (chat chats-index)
-      (let* ((timestamp (when (map-elt chat :last-updated)
-                          (condition-case nil
-                              (parse-iso8601-time-string (map-elt chat :last-updated))
-                            (error nil))))
+      (let* ((timestamp (wasabi--parse-timestamp (map-elt chat :last-updated)))
              (date-time (when timestamp
                           (decode-time timestamp)))
              (date-label (if date-time
@@ -1260,11 +1568,10 @@ Returns list of (date-label . chats-for-that-date)."
 
 DISPLAY-NAME is the contact/group name.
 IS-GROUP indicates if this is a group chat.
-LAST-UPDATED is the ISO timestamp string."
-  (let ((time-str (when last-updated
-                    (condition-case nil
-                        (format-time-string "%H:%M" (parse-iso8601-time-string last-updated))
-                      (error "")))))
+LAST-UPDATED is the protocol timestamp string."
+  (let* ((timestamp (wasabi--parse-timestamp last-updated))
+         (time-str (when timestamp
+                     (format-time-string "%H:%M" timestamp))))
     (concat (if is-group
                 (propertize "G" 'face 'success)
               " ")
@@ -1394,43 +1701,81 @@ P-CHAT-ENTRY is protocol chat entry:
  (chat-jid . ((chat_jid . ...) (last_updated . ...))).
 CONTACTS is internal contacts alist (already parsed).
 GROUPS is internal groups alist (already parsed).
-Returns alist with :chat-jid, :display-name, :last-updated, :is-group."
-  (let* ((chat-jid (car p-chat-entry))
+Returns alist with :chat-jid, :canonical-jid, :alt-jids, :display-name,
+:named, :is-group and :last-updated."
+  (let* ((chat-jid (wasabi--jid-string (car p-chat-entry)))
          (p-metadata (cdr p-chat-entry))
          (last-updated (map-elt p-metadata 'last_updated))
-         (is-group (string-match "@g\\.us$" chat-jid))
+         (is-group (wasabi--group-jid-p chat-jid))
          (name (if is-group
                    ;; TODO: Do we need symbols here? Why not keep as string?
-                   (map-nested-elt groups (list (intern chat-jid) :name))
-                 ;; For contacts, look up in contacts list
-                 (when-let ((contact (map-elt contacts (intern chat-jid))))
-                   (or (map-elt contact :full-name)
-                       (map-elt contact :push-name)))))
-         (identifier (when (string-match "\\([^@]+\\)@" chat-jid)
-                       (match-string 1 chat-jid)))
+                   (map-nested-elt groups (list (intern (wasabi--normalize-jid chat-jid))
+                                                :name))
+                 ;; For contacts, look up in contacts list.  The lookup goes
+                 ;; through every known JID variant: the contact list is
+                 ;; keyed by whichever addressing WhatsApp stored, which is
+                 ;; often not the one the chat index uses.
+                 (wasabi--contact-display-name chat-jid contacts)))
+         (identifier (wasabi--jid-identifier chat-jid))
          (display-name (or name identifier chat-jid)))
-    `((:chat-jid . ,chat-jid)
-      (:display-name . ,display-name)
-      (:is-group . ,is-group)
-      (:last-updated . ,last-updated))))
+    ;; Built with `list' and `cons' rather than a backquote: the
+    ;; :alt-jids cell is mutated when entries merge, and backquote is
+    ;; free to share its constant sub-structure between calls.
+    (list (cons :chat-jid chat-jid)
+          (cons :canonical-jid (wasabi--canonical-jid chat-jid))
+          (cons :alt-jids nil)
+          (cons :display-name display-name)
+          (cons :named (and name t))
+          (cons :is-group (and is-group t))
+          (cons :last-updated last-updated))))
+
+(defun wasabi--merge-chat-index-entries (entries)
+  "Merge ENTRIES that address the same peer under different JIDs.
+
+ENTRIES must be ordered most recently updated first.  A merged entry
+keeps the most recent JID, which is where new messages land, plus the
+best display name either entry could resolve.  Superseded JIDs are kept
+in :alt-jids.
+
+History recorded under a superseded JID is not folded in: wuzapi stores
+it under that JID and we fetch one history per chat."
+  (let ((merged '()))
+    (dolist (entry entries)
+      (let ((existing (seq-find (lambda (candidate)
+                                  (equal (map-elt candidate :canonical-jid)
+                                         (map-elt entry :canonical-jid)))
+                                merged)))
+        (if (not existing)
+            (push (copy-alist entry) merged)
+          (map-put! existing :alt-jids
+                    (append (map-elt existing :alt-jids)
+                            (list (map-elt entry :chat-jid))
+                            (map-elt entry :alt-jids)))
+          ;; Keep whichever JID managed to resolve a real name.
+          (when (and (not (map-elt existing :named))
+                     (map-elt entry :named))
+            (map-put! existing :display-name (map-elt entry :display-name))
+            (map-put! existing :named t)))))
+    (nreverse merged)))
 
 (defun wasabi--parse-chat-index (p-chat-index contacts groups)
   "Parse chat index response to list of internal chat entries.
 P-CHAT-INDEX is the raw response from chat.history with chat_jid='index'.
 CONTACTS is internal contacts alist (already parsed).
 GROUPS is internal groups alist (already parsed).
-Returns list of internal chat entry alists, filtered and sorted."
+Returns list of internal chat entry alists, filtered, sorted and merged."
   (let* ((parsed (delq nil
                        (mapcar (lambda (p-entry)
                                  ;; Filter out status broadcasts
-                                 (unless (string= (car p-entry) "status@broadcast")
+                                 (unless (equal (wasabi--jid-string (car p-entry))
+                                                "status@broadcast")
                                    (wasabi--parse-chat-index-entry p-entry contacts groups)))
                                p-chat-index)))
          (sorted (sort parsed
                        (lambda (a b)
-                         (string> (or (map-elt a :last-updated) "")
-                                  (or (map-elt b :last-updated) ""))))))
-    sorted))
+                         (wasabi--timestamp-newer-p (map-elt a :last-updated)
+                                                    (map-elt b :last-updated))))))
+    (wasabi--merge-chat-index-entries sorted)))
 
 ;; Protocol request builders
 

@@ -30,6 +30,13 @@
 
 ;;; Code:
 
+(eval-when-compile
+  (require 'cl-lib))
+(require 'map)
+(require 'seq)
+(require 'wasabi-chat)
+(require 'wasabi-icon)
+
 (defcustom wasabi-message-notification-function 'notifications
   "Function or symbol to handle message notifications.
 
@@ -46,68 +53,67 @@ This can be:
     (function :tag "Custom function"))
   :group 'wasabi)
 
-(defun wasabi--notify (message)
-  "Display a notification with MESSAGE if needed."
+(cl-defun wasabi--notify (message &key chat-buffer)
+  "Display a notification with MESSAGE if needed.
+
+CHAT-BUFFER is the chat buffer MESSAGE belongs to, when one is open.
+It is optional: a message is worth announcing whether or not its chat
+happens to be on screen."
   (when wasabi-message-notification-function
     (cond
      ((eq wasabi-message-notification-function 'notifications)
-      (wasabi--notify-with-notifications message))
+      (wasabi--notify-with-notifications message chat-buffer))
      ((eq wasabi-message-notification-function 'knockknock)
-      (wasabi--notify-with-knockknock message))
+      (wasabi--notify-with-knockknock message chat-buffer))
      ((functionp wasabi-message-notification-function)
       (funcall wasabi-message-notification-function message)))))
 
-(defun wasabi--get-msg-content (target-id)
-  "Get the content of the message with TARGET-ID."
-  (let ((msg
-         (seq-find
-          (lambda (msg)
-            (string= (map-elt msg :message-id) target-id))
-          (map-elt wasabi-chat--chat :messages))))
-    (when msg
+(defun wasabi--get-msg-content (target-id chat-buffer)
+  "Get the content of the message with TARGET-ID in CHAT-BUFFER.
+
+Returns nil when CHAT-BUFFER is not open: the reacted-to message is
+only known to a rendered chat."
+  (when (and target-id chat-buffer (buffer-live-p chat-buffer))
+    (when-let ((msg (seq-find
+                     (lambda (msg)
+                       (equal (map-elt msg :message-id) target-id))
+                     (map-elt (buffer-local-value 'wasabi-chat--chat chat-buffer)
+                              :messages))))
       (map-elt msg :content))))
 
-(defun wasabi--notify-with-notifications (message)
-  "Display a notification with MESSAGE using the `notifications' package."
-  (when (featurep 'notifications)
-    (if (map-elt message :is-reaction)
-        (notifications-notify
-         :title (map-elt message :sender-name)
-         :body
-         (concat
-          "Reacted to "
-          (wasabi--get-msg-content (map-elt message :target-id))
-          " with: "
-          (map-elt message :emoji))
-         :app-name "Wasabi"
-         :app-icon (wasabi-icon--svg-file)
-         :urgency 'normal)
-      (notifications-notify
-       :title (map-elt message :sender-name)
-       :body (map-elt message :content)
-       :app-name "Wasabi"
-       :app-icon (wasabi-icon--svg-file)
-       :urgency 'normal))))
+(defun wasabi--reaction-body (message chat-buffer)
+  "Describe the reaction in MESSAGE, looking up its target in CHAT-BUFFER."
+  (if-let ((content (wasabi--get-msg-content (map-elt message :target-id)
+                                             chat-buffer)))
+      (concat "Reacted to " content " with: " (map-elt message :emoji))
+    (concat "Reacted with: " (map-elt message :emoji))))
 
-(defun wasabi--notify-with-knockknock (message)
-  "Display a notification with MESSAGE using the `knockknock' package."
-  (when (featurep 'knockknock)
-    (if (map-elt message :is-reaction)
-        (knockknock-notify
-         :title (map-elt message :sender-name)
-         :message
-         (concat
-          "Reacted to "
-          (wasabi--get-msg-content (map-elt message :target-id))
-          " with: "
-          (map-elt message :emoji))
-         :app-name "Wasabi"
-         :icon-file (wasabi-icon--svg-file))
-      (knockknock-notify
-       :title (map-elt message :sender-name)
-       :message (map-elt message :content)
-       :app-name "Wasabi"
-       :icon-file (wasabi-icon--svg-file)))))
+(defun wasabi--notify-with-notifications (message chat-buffer)
+  "Display a notification with MESSAGE using the `notifications' package.
+
+CHAT-BUFFER is the chat MESSAGE belongs to, or nil."
+  (when (require 'notifications nil t)
+    (notifications-notify
+     :title (map-elt message :sender-name)
+     :body (if (map-elt message :is-reaction)
+               (wasabi--reaction-body message chat-buffer)
+             (map-elt message :content))
+     :app-name "Wasabi"
+     :app-icon (wasabi-icon--svg-file)
+     :urgency 'normal)))
+
+(defun wasabi--notify-with-knockknock (message chat-buffer)
+  "Display a notification with MESSAGE using the `knockknock' package.
+
+CHAT-BUFFER is the chat MESSAGE belongs to, or nil."
+  (when (require 'knockknock nil t)
+    (knockknock-notify
+     :title (map-elt message :sender-name)
+     :message (if (map-elt message :is-reaction)
+                  (wasabi--reaction-body message chat-buffer)
+                (map-elt message :content))
+     :app-name "Wasabi"
+     :icon-file (wasabi-icon--svg-file))))
 
 
 (provide 'wasabi-notifications)

@@ -32,6 +32,7 @@
   (require 'cl-lib))
 (require 'map)
 (require 'parse-time)
+(require 'seq)
 (require 'wasabi-icon)
 
 (declare-function wasabi--add-action-to-text "wasabi")
@@ -43,6 +44,17 @@
 (declare-function wasabi--send-chat-send-text-request "wasabi")
 (declare-function wasabi--send-download-image-request "wasabi")
 (declare-function wasabi--send-download-video-request "wasabi")
+(declare-function wasabi--canonical-jid "wasabi")
+(declare-function wasabi--contact-display-name "wasabi")
+(declare-function wasabi--group-jid-p "wasabi")
+(declare-function wasabi--jid-identifier "wasabi")
+(declare-function wasabi--jid-string "wasabi")
+(declare-function wasabi--learn-jid-aliases-from-info "wasabi")
+(declare-function wasabi--parse-timestamp "wasabi")
+(declare-function wasabi--save-jid-aliases "wasabi")
+(declare-function wasabi--same-chat-p "wasabi")
+(declare-function wasabi--timestamp-older-p "wasabi")
+(declare-function wasabi-data-dir "wasabi")
 
 (cl-defun wasabi-chat--make-chat (&key chat-jid contact-name max-sender-width messages)
   "Create a chat alist with CHAT-JID, CONTACT-NAME, MAX-SENDER-WIDTH, and MESSAGES."
@@ -182,25 +194,22 @@ Returns string like \"Hello\" or \"[image]\"."
   "Parse sender name from P-DATA and P-SENDER-JID.
 CONTACTS is the internal contacts alist for name resolution.
 CONTACT-NAME is an optional fallback name."
-  (cond
-   ((map-nested-elt p-data '(Info IsFromMe))
-    "Me")
-   ((and p-sender-jid contacts
-         (map-elt contacts (intern p-sender-jid)))
-    (let* ((contact (map-elt contacts (intern p-sender-jid)))
-           (full-name (map-elt contact :full-name))
-           (push-name (map-elt contact :push-name)))
-      (or (and full-name (not (string-empty-p full-name)) full-name)
-          (and push-name (not (string-empty-p push-name)) push-name))))
-   (t
-    (let ((push-name (map-nested-elt p-data '(Info PushName))))
-      (or (and push-name (not (string-empty-p push-name)) push-name)
-          (and contact-name (not (string-empty-p contact-name)) contact-name)
-          (and p-sender-jid
-               (if (string-match "\\([^@]+\\)@" p-sender-jid)
-                   (match-string 1 p-sender-jid)
-                 p-sender-jid))
-          "Unknown")))))
+  (or (when (map-nested-elt p-data '(Info IsFromMe))
+        "Me")
+      ;; Resolved across every known JID variant: contacts are keyed by
+      ;; whichever addressing WhatsApp stored, not necessarily the
+      ;; sender's.
+      (wasabi--contact-display-name p-sender-jid contacts)
+      (let ((push-name (map-nested-elt p-data '(Info PushName))))
+        (and push-name (not (string-empty-p push-name)) push-name))
+      ;; The chat's own name only names the sender one to one.  In a
+      ;; group it is the group's name, not a participant's.
+      (and contact-name
+           (not (string-empty-p contact-name))
+           (not (wasabi--group-jid-p (map-nested-elt p-data '(Info Chat))))
+           contact-name)
+      (wasabi--jid-identifier p-sender-jid)
+      "Unknown"))
 
 (cl-defun wasabi-chat--parse-message (p-message &key chat-jid contact-name contacts reactions)
   "Parse a protocol message (from database) into internal display format.
@@ -216,6 +225,10 @@ REACTIONS is a hash table of message-id -> list of reactions."
         (let ((p-data (json-parse-string data-json :object-type 'alist
                                          :null-object nil
                                          :false-object nil)))
+          ;; Stored history carries the same Info as a live event, so use
+          ;; it to learn LID/phone-number pairings for chats we have not
+          ;; seen a message in yet.
+          (wasabi--learn-jid-aliases-from-info (map-elt p-data 'Info))
           ;; Skip reaction messages - they're already in reactions.
           (unless (map-nested-elt p-data '(Message reactionMessage))
             (let* ((p-sender-jid (map-nested-elt p-data '(Info Sender)))
@@ -250,43 +263,37 @@ REACTIONS is a hash table of message-id -> list of reactions."
             (:content . ,content)))))))
 
 (cl-defun wasabi-chat--parse-notification (&key p-message p-info contact-name chat-jid contacts)
-  "Parse protocol notification MESSAGE and INFO into internal message format.
-Returns alist with :sender-name, :timestamp, :content.
-For reaction messages, also includes :is-reaction, :target-id, and :emoji."
-  (if-let ((reaction-msg (map-elt p-message 'reactionMessage)))
-      ;; This is a reaction
-      (let* ((target-id (map-nested-elt reaction-msg '(key ID)))
-             (emoji (map-elt reaction-msg 'text))
-             (sender-jid (map-elt p-info 'Sender))
-             (sender-name (if (map-elt p-info 'IsFromMe)
-                              "Me"
-                            (or contact-name
-                                (map-elt p-info 'PushName)
-                                (when sender-jid
-                                  (if (string-match "\\([^@]+\\)@" sender-jid)
-                                      (match-string 1 sender-jid)
-                                    sender-jid))
-                                chat-jid))))
+  "Parse protocol notification P-MESSAGE and P-INFO into internal format.
+CONTACT-NAME is the chat's display name, CHAT-JID its JID, and CONTACTS
+the internal contacts alist used to resolve the sender.
+Returns alist with :sender-name, :timestamp and :content.
+For reaction messages, also includes :is-reaction, :target-id and :emoji."
+  (let* ((is-from-me (map-elt p-info 'IsFromMe))
+         (sender-jid (map-elt p-info 'Sender))
+         (push-name (map-elt p-info 'PushName))
+         (is-group (or (map-elt p-info 'IsGroup)
+                       (wasabi--group-jid-p chat-jid)))
+         (sender-name
+          (or (when is-from-me "Me")
+              ;; Resolved across every known JID variant: a sender can be
+              ;; addressed differently to the contact we have stored.
+              (wasabi--contact-display-name sender-jid contacts)
+              (and push-name (not (string-empty-p push-name)) push-name)
+              ;; The chat's own name only names the sender one to one.  In
+              ;; a group it is the group's name, not a participant's.
+              (and (not is-group) contact-name)
+              (wasabi--jid-identifier sender-jid)
+              (wasabi--jid-string chat-jid))))
+    (if-let ((reaction-msg (map-elt p-message 'reactionMessage)))
+        ;; This is a reaction
         `((:is-reaction . t)
-          (:target-id . ,target-id)
-          (:emoji . ,emoji)
-          (:sender-name . ,sender-name)))
-    ;; Regular message
-    (let* ((is-from-me (map-elt p-info 'IsFromMe))
-           (sender-name (if is-from-me
-                            "Me"
-                          (or contact-name
-                              (map-elt p-info 'PushName)
-                              (when-let ((sender (map-elt p-info 'Sender)))
-                                (if (string-match "\\([^@]+\\)@" sender)
-                                    (match-string 1 sender)
-                                  sender))
-                              chat-jid)))
-           (content (wasabi-chat--parse-content p-message))
-           (timestamp (map-elt p-info 'Timestamp)))
+          (:target-id . ,(map-nested-elt reaction-msg '(key ID)))
+          (:emoji . ,(map-elt reaction-msg 'text))
+          (:sender-name . ,sender-name))
+      ;; Regular message
       `((:sender-name . ,sender-name)
-        (:timestamp . ,timestamp)
-        (:content . ,content)))))
+        (:timestamp . ,(map-elt p-info 'Timestamp))
+        (:content . ,(wasabi-chat--parse-content p-message))))))
 
 (cl-defun wasabi-chat--parse-reactions (p-messages &key contacts)
   "Parse reactions from P-MESSAGES and return a hash map of message-id -> reactions.
@@ -323,10 +330,13 @@ Messages with reactions will have a :reactions field."
                                                              :contacts contacts
                                                              :reactions reactions))
                                (append p-messages nil)))))
+    ;; Parsing learns JID pairings from each message's Info; persist
+    ;; whatever this batch turned up, in one go.
+    (wasabi--save-jid-aliases)
     (sort parsed
           (lambda (a b)
-            (string< (map-elt a :timestamp)
-                     (map-elt b :timestamp))))))
+            (wasabi--timestamp-older-p (map-elt a :timestamp)
+                                       (map-elt b :timestamp))))))
 
 (defun wasabi-chat--calculate-max-sender-width (messages)
   "Calculate maximum sender name width from internal MESSAGES for alignment."
@@ -477,7 +487,9 @@ Shows different bindings depending on whether point is in input area."
     (message "Sending...")
     (with-current-buffer (wasabi--buffer)
       (wasabi--send-chat-send-text-request
-       :phone chat-jid
+       ;; Send to the canonical JID: when a contact's phone number
+       ;; addressing is known, prefer it over a LID.
+       :phone (wasabi--canonical-jid chat-jid)
        :body text
        :on-failure (lambda (error)
                      (message "Failed to send")
@@ -490,9 +502,15 @@ Shows different bindings depending on whether point is in input area."
                        (insert text)))
        :on-success (lambda (response)
                      (message "Sent")
-                     ;; Response Timestamp is Unix timestamp (integer),
-                     ;; convert to ISO 8601 string.
-                     (let* ((timestamp-str (format-time-string "%Y-%m-%dT%H:%M:%S%z" (map-elt response 'Timestamp)))
+                     ;; Response Timestamp is usually a Unix timestamp
+                     ;; (integer); tolerate a string or a missing one.
+                     (let* ((stamp (map-elt response 'Timestamp))
+                            (timestamp-str
+                             (cond ((numberp stamp)
+                                    (format-time-string "%Y-%m-%dT%H:%M:%S%z" stamp))
+                                   ((and (stringp stamp) (not (string-empty-p stamp)))
+                                    stamp)
+                                   (t (format-time-string "%Y-%m-%dT%H:%M:%S%z"))))
                             (message `((:sender-name . "Me")
                                        (:timestamp . ,timestamp-str)
                                        (:content . ,text))))
@@ -650,8 +668,9 @@ MESSAGE-ID is used to tag the rendered message for later updates."
                              'wasabi-message-id message-id))
          (sender-padding (make-string (max 0 (- (or max-sender-width 0)
                                                 (string-width sender))) ?\s))
-         (time (when timestamp
-                 (propertize (format-time-string "%H:%M" (parse-iso8601-time-string timestamp))
+         (parsed-time (wasabi--parse-timestamp timestamp))
+         (time (when parsed-time
+                 (propertize (format-time-string "%H:%M" parsed-time)
                              'face 'font-lock-comment-face))))
     ;;
     ;; Intended layout per message:
@@ -809,23 +828,66 @@ Finds the message in :messages, updates it, and re-renders just that message."
                   (insert "\n\n")))))))
     (wasabi--log "Could not find message with ID %s to add reaction" target-id)))
 
+(defun wasabi-chat--find-buffer (chat-jid)
+  "Return the chat buffer showing CHAT-JID, or nil.
+
+Buffers are matched on chat identity rather than on their name: two
+contacts can share a name, and one contact can be addressed under more
+than one JID."
+  (when chat-jid
+    (seq-find (lambda (buffer)
+                (with-current-buffer buffer
+                  (and (derived-mode-p 'wasabi-chat-mode)
+                       (wasabi--same-chat-p (map-elt wasabi-chat--chat :chat-jid)
+                                            chat-jid))))
+              (buffer-list))))
+
+(defun wasabi-chat--buffer-name (chat-jid contact-name)
+  "Return a buffer name for CHAT-JID titled CONTACT-NAME.
+
+The name is for humans; identity lives in `wasabi-chat--chat'.  When a
+different chat already holds that name, a unique one is generated
+rather than the two chats sharing a buffer."
+  (let ((name (format "*Wasabi: %s*" (or contact-name chat-jid))))
+    (if-let ((existing (get-buffer name)))
+        (if (with-current-buffer existing
+              (and (derived-mode-p 'wasabi-chat-mode)
+                   (wasabi--same-chat-p (map-elt wasabi-chat--chat :chat-jid)
+                                        chat-jid)))
+            name
+          (generate-new-buffer-name name))
+      name)))
+
 (cl-defun wasabi-chat--start (&key chat-jid messages contact-name)
-  "Create and display a chat buffer for CHAT-JID.
+  "Create, or reuse, and display a chat buffer for CHAT-JID.
 MESSAGES is a list of already-parsed internal message alists.
 CONTACT-NAME is the display name of the contact (or nil if not available).
 Displays messages in a two-column format: sender | message."
   (unless chat-jid
     (error ":chat-jid is required"))
-  ;; TODO: Consolidate buffer creation logic.
-  (let ((chat-buffer (get-buffer-create (format "*Wasabi: %s*" (or contact-name chat-jid)))))
+  (let ((chat-buffer (wasabi-chat--find-buffer chat-jid)))
+    (if chat-buffer
+        (with-current-buffer chat-buffer
+          ;; Re-point the buffer at this JID.  The same chat reaches us
+          ;; under either of its JIDs, and what we send must follow the
+          ;; one we were just handed.
+          (wasabi-chat--update-chat :chat-jid chat-jid)
+          (when contact-name
+            (wasabi-chat--update-chat :contact-name contact-name))
+          (let ((name (wasabi-chat--buffer-name chat-jid contact-name)))
+            (unless (equal (buffer-name) name)
+              (rename-buffer name t)))
+          (wasabi-chat--refresh messages))
+      (setq chat-buffer (get-buffer-create
+                         (wasabi-chat--buffer-name chat-jid contact-name)))
+      (with-current-buffer chat-buffer
+        (unless (derived-mode-p 'wasabi-chat-mode)
+          (wasabi-chat-mode))
+        (setq wasabi-chat--chat (wasabi-chat--make-chat :chat-jid chat-jid
+                                                        :contact-name contact-name))
+        (wasabi-chat--refresh messages)))
     (with-current-buffer chat-buffer
-      (unless (derived-mode-p 'wasabi-chat-mode)
-        (wasabi-chat-mode))
-      (setq wasabi-chat--chat (wasabi-chat--make-chat :chat-jid chat-jid
-                                                      :contact-name contact-name))
-      (wasabi-chat--refresh messages)
       (goto-char (point-max)))
-
     (switch-to-buffer chat-buffer)))
 
 (defun wasabi-chat-play-video-at-point ()
