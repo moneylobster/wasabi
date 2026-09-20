@@ -148,11 +148,13 @@
     (should (wasabi--timestamp-older-p iso go))
     (should-not (wasabi--timestamp-older-p go iso))
     (should (wasabi--timestamp-newer-p go iso))
-    ;; Undated entries sort last either way.
+    ;; An undated chat sorts to the bottom of the list.
     (should (wasabi--timestamp-newer-p iso nil))
     (should-not (wasabi--timestamp-newer-p nil iso))
-    (should (wasabi--timestamp-older-p iso nil))
-    (should-not (wasabi--timestamp-older-p nil iso))))
+    ;; An undated message sorts to the top of a conversation, rather
+    ;; than to the bottom where it would read as the latest thing said.
+    (should (wasabi--timestamp-older-p nil iso))
+    (should-not (wasabi--timestamp-older-p iso nil))))
 
 ;;; Chat index
 
@@ -552,6 +554,70 @@
     (should-not (wasabi--latest-message-timestamp
                  "1@s.whatsapp.net"
                  (list (cons "1@s.whatsapp.net" (list '((message_id . "A")))))))))
+
+(ert-deftest wasabi-test-parse-epoch-timestamps ()
+  ;; Compared as instants: Emacs has several representations of one.
+  (let ((expected (parse-iso8601-time-string "2025-11-11T12:00:00Z")))
+    ;; Seconds, as a number and as the string of digits it can arrive as.
+    (should (time-equal-p (wasabi--parse-timestamp 1762862400) expected))
+    (should (time-equal-p (wasabi--parse-timestamp "1762862400") expected))
+    ;; Milliseconds.
+    (should (time-equal-p (wasabi--parse-timestamp 1762862400000) expected)))
+  (should-not (wasabi--parse-timestamp t))
+  (should-not (wasabi--parse-timestamp '(1 2))))
+
+(ert-deftest wasabi-test-epoch-and-iso-order-together ()
+  ;; A chat's history can mix the two, and did: the epoch ones used to
+  ;; fail to parse and so sorted as though they were the newest.
+  (let ((older 1762862400)
+        (newer "2025-11-19T18:00:00Z"))
+    (should (wasabi--timestamp-older-p older newer))
+    (should-not (wasabi--timestamp-older-p newer older))
+    (should (wasabi--timestamp-newer-p newer older))))
+
+(ert-deftest wasabi-test-index-dates-chats-from-epoch-messages ()
+  (wasabi-test--with-clean-jids
+    (let* ((chats (list (cons "1@s.whatsapp.net"
+                              (list '((message_id . "A") (timestamp . 1762862400))
+                                    '((message_id . "B") (timestamp . 1763380800))))))
+           (index (wasabi--parse-chat-index
+                   (list (wasabi-test--index-entry "1@s.whatsapp.net"
+                                                   "2025-11-20T09:00:00Z"))
+                   nil nil chats)))
+      (should (time-equal-p (wasabi--parse-timestamp
+                             (map-elt (car index) :last-updated))
+                            (wasabi--parse-timestamp 1763380800))))))
+
+(ert-deftest wasabi-test-silent-refresh-flag-round-trips ()
+  ;; `map-put!' can only update a key an alist already has: it signals
+  ;; map-not-inplace otherwise, which used to abort the HistorySync and
+  ;; OfflineSyncCompleted handlers before they re-fetched anything.
+  (let ((buffer (generate-new-buffer "*wasabi-state-test*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (wasabi-mode)
+          (setq wasabi--state (wasabi--make-state :wasabi-buffer buffer))
+          (map-put! wasabi--state :silent-refresh t)
+          (should (map-elt wasabi--state :silent-refresh))
+          ;; Reaching ready clears it without removing the key, so the
+          ;; next sync can set it again.
+          (wasabi--set-status :type 'ready :message nil)
+          (should-not (map-elt wasabi--state :silent-refresh))
+          (map-put! wasabi--state :silent-refresh t)
+          (should (map-elt wasabi--state :silent-refresh)))
+      (kill-buffer buffer))))
+
+(ert-deftest wasabi-test-state-declares-every-key-it-puts ()
+  ;; Same trap, for every key the code writes with `map-put!'.
+  (let ((buffer (generate-new-buffer "*wasabi-state-test*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (wasabi-mode)
+          (setq wasabi--state (wasabi--make-state :wasabi-buffer buffer))
+          (dolist (key '(:client :status :connected :contacts :chats-index
+                                 :p-chat-index :chats :groups :silent-refresh))
+            (should (assq key wasabi--state))))
+      (kill-buffer buffer))))
 
 (provide 'wasabi-test)
 ;;; wasabi-test.el ends here

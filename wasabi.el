@@ -364,18 +364,31 @@ only what they call themselves."
 (defun wasabi--parse-timestamp (timestamp)
   "Parse protocol TIMESTAMP into an Emacs time value, or nil.
 
-Handles both ISO 8601 (\"2025-11-11T12:00:00Z\", used by message
-events) and Go's default time format (\"2025-11-11 12:00:00.000000
-+0000 GMT\", used by the chat index)."
-  (when (and (stringp timestamp)
-             (not (string-empty-p timestamp)))
+Handles ISO 8601 (\"2025-11-11T12:00:00Z\", used by message events),
+Go's default time format (\"2025-11-11 12:00:00.000000 +0000 GMT\", used
+by the chat index) and a Unix epoch, as a number or a string of
+digits, in seconds or milliseconds."
+  (cond
+   ((null timestamp) nil)
+   ;; A Unix epoch, in seconds or in milliseconds.
+   ((numberp timestamp)
+    (ignore-errors
+      (seconds-to-time (if (> timestamp 100000000000) (/ timestamp 1000.0)
+                         timestamp))))
+   ((not (stringp timestamp)) nil)
+   ((string-empty-p timestamp) nil)
+   ;; An epoch that arrived as a string.  Checked before ISO 8601, which
+   ;; would otherwise make something of the digits.
+   ((string-match-p "\\`[0-9]+\\'" timestamp)
+    (wasabi--parse-timestamp (string-to-number timestamp)))
+   (t
     (or (ignore-errors (parse-iso8601-time-string timestamp))
         (ignore-errors
           (let ((parsed (parse-time-string timestamp)))
             (when (and (decoded-time-year parsed)
                        (decoded-time-month parsed)
                        (decoded-time-day parsed))
-              (encode-time (decoded-time-set-defaults parsed))))))))
+              (encode-time (decoded-time-set-defaults parsed)))))))))
 
 (defun wasabi--timestamp-newer-p (a b)
   "Return non-nil when timestamp A is more recent than timestamp B.
@@ -390,11 +403,13 @@ Missing or unparseable timestamps sort last."
 (defun wasabi--timestamp-older-p (a b)
   "Return non-nil when timestamp A precedes timestamp B.
 
-Missing or unparseable timestamps sort last."
+A timestamp we cannot read sorts first.  In a conversation that puts it
+out of the way at the top, where it reads as old news, rather than at
+the bottom pretending to be the latest thing said."
   (let ((ta (wasabi--parse-timestamp a))
         (tb (wasabi--parse-timestamp b)))
     (cond ((and ta tb) (time-less-p ta tb))
-          (ta t)
+          (tb t)
           (t nil))))
 
 (defun wasabi--chat-display-name (chat-jid)
@@ -437,10 +452,6 @@ For silent progression, set :silent-refresh in state before calling."
     (wasabi--set-status :type status-type
                         :message status-message
                         :silent (map-elt (wasabi--state) :silent-refresh)))
-
-  ;; Silent flag no longer necessary after ready. Clear it.
-  (when (eq status-type 'ready)
-    (map-delete (wasabi--state) :silent-refresh))
 
   (cond
    ;; Step 1: Create client
@@ -557,32 +568,19 @@ For silent progression, set :silent-refresh in state before calling."
    ((eq (map-nested-elt (wasabi--state) '(:status :type))
         'fetch-contacts)
     (wasabi--log "Fetching contacts...")
-    (acp-send-request :client (map-elt (wasabi--state) :client)
-                      :request (wasabi--make-user-contacts-request
-                                :token wasabi-user-token)
-                      ;; Response is an array of contacts
-                      :on-success (lambda (p-contacts)
-                                    (let* ((contacts (wasabi--parse-contacts p-contacts)))
-                                      ;; For debugging:
-                                      ;; (when (seq-first p-contacts)
-                                      ;;   (wasabi--log "Sample RAW contact: %s" (seq-first p-contacts)))
-                                      (map-put! (wasabi--state) :contacts contacts)
-                                      (wasabi--log "Fetched %d contacts" (length contacts))
-                                      ;; For debugging:
-                                      ;; (when (seq-first contacts)
-                                      ;;   (wasabi--log "Sample PARSED contact: %s" (seq-first contacts)))
-                                      (when (= (length contacts) 0)
-                                        (wasabi--log "No contacts from backend (expected on fresh pairing)"))
-                                      ;; Continue to fetch groups regardless of contact count.
-                                      ;; WhatsApp Web may not provide contacts on fresh pairing.
-                                      (wasabi--initialize :wasabi-buffer wasabi-buffer
-                                                          :status-type 'fetch-groups
-                                                          :status-message
-                                                          (wasabi--make-loading-message))))
-                      :on-failure (lambda (error)
-                                    (wasabi--log "Failed to fetch contacts: %s" (map-elt error 'message))
-                                    (wasabi--set-status :type 'error
-                                                        :message (wasabi--refresh-error :message "Failed to fetch contacts")))))
+    (wasabi--send-contacts-request
+     ;; Continue to fetch groups regardless of contact count.
+     ;; WhatsApp Web may not provide contacts on fresh pairing.
+     :on-finished (lambda (_contacts)
+                    (wasabi--initialize :wasabi-buffer wasabi-buffer
+                                        :status-type 'fetch-groups
+                                        :status-message
+                                        (wasabi--make-loading-message)))
+     :on-failure (lambda (_error)
+                   (wasabi--set-status
+                    :type 'error
+                    :message (wasabi--refresh-error
+                              :message "Failed to fetch contacts")))))
    ;; Step 7: Fetch groups
    ((eq (map-nested-elt (wasabi--state) '(:status :type))
         'fetch-groups)
@@ -756,6 +754,28 @@ Gathering a chat from several JIDs can turn up the same message twice."
           (when id (puthash id t seen))
           (push p-message kept))))
     (nreverse kept)))
+
+(cl-defun wasabi--send-contacts-request (&key on-finished on-failure)
+  "Fetch the contact list and store it in state as :contacts.
+
+Invoke ON-FINISHED on success, or ON-FAILURE with the error."
+  (acp-send-request
+   :client (map-elt (wasabi--state) :client)
+   :request (wasabi--make-user-contacts-request :token wasabi-user-token)
+   ;; Response is an array of contacts
+   :on-success (lambda (p-contacts)
+                 (let ((contacts (wasabi--parse-contacts p-contacts)))
+                   (map-put! (wasabi--state) :contacts contacts)
+                   (wasabi--log "Fetched %d contacts" (length contacts))
+                   (when (= (length contacts) 0)
+                     (wasabi--log "No contacts from backend (expected on fresh pairing)"))
+                   (when on-finished
+                     (funcall on-finished contacts))))
+   :on-failure (lambda (error)
+                 (wasabi--log "Failed to fetch contacts: %s"
+                              (or (map-elt error 'message) "unknown"))
+                 (when on-failure
+                   (funcall on-failure error)))))
 
 (cl-defun wasabi--send-chat-index-request (&key on-finished)
   "Fetch the chat index and store it in state as :chats-index.
@@ -978,7 +998,15 @@ Calls ON-FAILURE with error if download fails."
                                                      :status-type 'fetch-contacts
                                                      :status-message (wasabi--make-loading-message)))))
                             ((equal (map-elt notification 'method) "AppStateSyncComplete")
-                             (wasabi--log "App state sync complete"))
+                             (wasabi--log "App state sync complete")
+                             ;; Contacts travel with app state, which lands
+                             ;; well after the startup fetch has run, so the
+                             ;; names we could not resolve then arrive here.
+                             (when (eq (map-nested-elt (wasabi--state) '(:status :type))
+                                       'ready)
+                               (wasabi--send-contacts-request
+                                :on-finished (lambda (_contacts)
+                                               (wasabi--reparse-chat-index)))))
                             ((equal (map-elt notification 'method) "ConnectFailure")
                              (map-put! (wasabi--state) :connected nil)
                              (wasabi--log "Couldn't connect: %s"
@@ -1217,7 +1245,13 @@ The :connected flag tracks WhatsApp connection state (updated by notifications).
         ;;  ("987654321@g.us" . [...])
         ;;  ...)
         (cons :chats nil)
-        (cons :groups nil)))
+        (cons :groups nil)
+        ;; Set while a background re-fetch runs, so status changes do
+        ;; not flash over the chat list.  Declared here because
+        ;; `map-put!' cannot add a key to an alist in place: it signals
+        ;; map-not-inplace, which used to abort the sync handlers before
+        ;; they could re-fetch anything.
+        (cons :silent-refresh nil)))
 
 (cl-defun wasabi--make-status (&key type message)
   "Create a status object with TYPE and optional MESSAGE.
@@ -1241,6 +1275,11 @@ Optional SILENT suppresses visual messaging during status change."
   (unless (derived-mode-p 'wasabi-mode)
     (error "Not in a chats buffer"))
   (map-put! (wasabi--state) :status (wasabi--make-status :type type :message message))
+  ;; A background refresh is over once we are ready again.  Set to nil
+  ;; rather than deleted: `map-put!' can only update a key an alist
+  ;; already has, so removing it would break the next refresh.
+  (when (eq type 'ready)
+    (map-put! (wasabi--state) :silent-refresh nil))
   (if (eq type 'ready)
       (wasabi--update-header-line)
     (setq header-line-format nil))
@@ -1811,9 +1850,13 @@ each conversation last saw a message.  Where we have already fetched a
 chat's history, the messages themselves know better."
   (when (and chat-jid chats)
     (let ((newest nil))
-      (dolist (jid (seq-uniq (cons chat-jid (wasabi--jid-variants chat-jid))))
+      (dolist (jid (seq-uniq (append (list chat-jid
+                                           (wasabi--normalize-jid chat-jid))
+                                     (wasabi--jid-variants chat-jid))))
         (dolist (p-message (append (map-elt chats jid) nil))
-          (let ((timestamp (map-elt p-message 'timestamp)))
+          (let ((timestamp (or (map-elt p-message 'timestamp)
+                               (map-elt p-message 'Timestamp)
+                               (map-elt p-message 'message_timestamp))))
             (when (and timestamp
                        (wasabi--timestamp-newer-p timestamp newest))
               (setq newest timestamp)))))
@@ -1831,7 +1874,13 @@ index is read again rather than refetched."
                         (map-elt (wasabi--state) :groups)
                         (map-elt (wasabi--state) :chats))))
       (map-put! (wasabi--state) :chats-index chats-index)
-      (wasabi--log "Loaded chat index: %d chats" (length chats-index))
+      (wasabi--log "Loaded chat index: %d chats (%d dated by their messages)"
+                   (length chats-index)
+                   (seq-count (lambda (chat)
+                                (wasabi--latest-message-timestamp
+                                 (map-elt chat :chat-jid)
+                                 (map-elt (wasabi--state) :chats)))
+                              chats-index))
       (wasabi--refresh))))
 
 (defun wasabi--merge-chat-index-entries (entries)
