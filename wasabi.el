@@ -102,6 +102,15 @@ Example:
                  (function :tag "Custom function"))
   :group 'wasabi)
 
+(defcustom wasabi-sync-quiet-seconds 30
+  "Seconds of quiet before a WhatsApp sync is taken to have finished.
+
+WhatsApp sends history in batches and does not reliably announce the
+last one, so the syncing indicator clears itself after this long
+without another batch arriving."
+  :type 'natnum
+  :group 'wasabi)
+
 (defun wasabi-data-dir ()
   "Return the data directory, ensuring it exists.
 Creates the directory if it doesn't exist.
@@ -987,6 +996,7 @@ Calls ON-FAILURE with error if download fails."
                                                                        :status-message (wasabi--make-loading-message))))))
                             ((equal (map-elt notification 'method) "OfflineSyncCompleted")
                              (wasabi--log "Offline sync completed")
+                             (wasabi--set-syncing nil)
                              (let ((status-type (map-nested-elt (wasabi--state) '(:status :type))))
                                ;; If we're ready, re-fetch all data since WhatsApp just synced
                                (when (eq status-type 'ready)
@@ -1002,11 +1012,12 @@ Calls ON-FAILURE with error if download fails."
                              ;; Contacts travel with app state, which lands
                              ;; well after the startup fetch has run, so the
                              ;; names we could not resolve then arrive here.
-                             (when (eq (map-nested-elt (wasabi--state) '(:status :type))
-                                       'ready)
-                               (wasabi--send-contacts-request
-                                :on-finished (lambda (_contacts)
-                                               (wasabi--reparse-chat-index)))))
+                             (if (eq (map-nested-elt (wasabi--state) '(:status :type))
+                                     'ready)
+                                 (wasabi--send-contacts-request
+                                  :on-finished (lambda (_contacts)
+                                                 (wasabi--reparse-chat-index)))
+                               (wasabi--refresh)))
                             ((equal (map-elt notification 'method) "ConnectFailure")
                              (map-put! (wasabi--state) :connected nil)
                              (wasabi--log "Couldn't connect: %s"
@@ -1064,6 +1075,9 @@ Calls ON-FAILURE with error if download fails."
                                          (wasabi-chat--append-message parsed))))))))
                             ((equal (map-elt notification 'method) "HistorySync")
                              (wasabi--log "HistorySync received")
+                             ;; Batches keep arriving for a while; each one
+                             ;; pushes back when we stop saying so.
+                             (wasabi--set-syncing "syncing messages")
                              (wasabi--log "HistorySync: current-buffer=%s, major-mode=%s" (current-buffer) major-mode)
                              ;; If we're ready, re-fetch all data since WhatsApp just synced history
                              (let ((status-type (map-nested-elt (wasabi--state) '(:status :type))))
@@ -1130,6 +1144,40 @@ Calls ON-FAILURE with error if download fails."
                                   :type 'error
                                   :message (wasabi--refresh-error
                                             :message "Lost connection to WhatsApp (keep-alive timeout).")))))))))
+
+(defun wasabi--syncing ()
+  "Return a label for what is being synced, or nil if nothing is."
+  (when wasabi--state
+    (cond ((map-elt wasabi--state :syncing))
+          ;; A background re-fetch, which is what a sync triggers once
+          ;; the chat list is already up.
+          ((map-elt wasabi--state :silent-refresh) "refreshing")
+          (t nil))))
+
+(defun wasabi--set-syncing (label)
+  "Note that LABEL is being synced, or nil when nothing is.
+
+WhatsApp announces history in batches without reliably announcing the
+last one, so the note clears itself once the batches stop arriving."
+  (unless (derived-mode-p 'wasabi-mode)
+    (error "Not in a chats buffer"))
+  (unless (equal (map-elt wasabi--state :syncing) label)
+    (map-put! wasabi--state :syncing label)
+    (wasabi--update-header-line)
+    (force-mode-line-update))
+  (when-let ((timer (map-elt wasabi--state :sync-timer)))
+    (cancel-timer timer)
+    (map-put! wasabi--state :sync-timer nil))
+  (when label
+    (let ((buffer (current-buffer)))
+      (map-put! wasabi--state :sync-timer
+                (run-at-time wasabi-sync-quiet-seconds nil
+                             (lambda ()
+                               (when (buffer-live-p buffer)
+                                 (with-current-buffer buffer
+                                   (when wasabi--state
+                                     (wasabi--set-syncing nil)
+                                     (wasabi--refresh))))))))))
 
 (defun wasabi--log (format-string &rest args)
   "Log a debug message to *Wasabi-Log* buffer.
@@ -1251,7 +1299,11 @@ The :connected flag tracks WhatsApp connection state (updated by notifications).
         ;; `map-put!' cannot add a key to an alist in place: it signals
         ;; map-not-inplace, which used to abort the sync handlers before
         ;; they could re-fetch anything.
-        (cons :silent-refresh nil)))
+        (cons :silent-refresh nil)
+        ;; What WhatsApp is currently syncing, if anything, and the
+        ;; timer that gives up waiting for it to say it has finished.
+        (cons :syncing nil)
+        (cons :sync-timer nil)))
 
 (cl-defun wasabi--make-status (&key type message)
   "Create a status object with TYPE and optional MESSAGE.
@@ -1359,6 +1411,11 @@ FACE when non-nil applies the specified face to the text."
     map)
   "Keymap for `wasabi-mode'.")
 
+(defcustom wasabi-sync-indicator "(*)"
+  "Marker shown in the header line while WhatsApp is syncing."
+  :type 'string
+  :group 'wasabi)
+
 (defun wasabi--update-header-line ()
   "Update the header line for the main chats app buffer."
   (let ((bindings `((:command wasabi-new-chat :description "new chat")
@@ -1374,6 +1431,10 @@ FACE when non-nil applies the specified face to the text."
            " "
            (propertize "Recent Chats" 'face 'font-lock-doc-face)
            " "
+           (when-let ((syncing (wasabi--syncing)))
+             (concat (propertize (format "%s %s" wasabi-sync-indicator syncing)
+                                 'face 'font-lock-comment-face)
+                     " "))
            (mapconcat
             #'identity
             (seq-filter
@@ -1707,12 +1768,16 @@ LAST-UPDATED is the protocol timestamp string."
           (let ((inhibit-read-only t))
             (erase-buffer)
             (wasabi--message :text
-                             (concat
-                              "No recent chats"
-                              "\n\n"
-                              (propertize "c" 'face 'help-key-binding)
-                              " "
-                              "to start a new chat")))
+                             (if (wasabi--syncing)
+                                 (concat "Syncing with WhatsApp"
+                                         "\n\n"
+                                         "Chats will appear as they arrive")
+                               (concat
+                                "No recent chats"
+                                "\n\n"
+                                (propertize "c" 'face 'help-key-binding)
+                                " "
+                                "to start a new chat"))))
         ;; Render chat list
         (let ((sections (mapcar
                          (lambda (date-group)
