@@ -384,6 +384,18 @@ Callers save once per batch of learning rather than per pairing."
         (dolist (entry chat-times)
           (puthash (car entry) (cdr entry) wasabi--chat-times-table))))))
 
+(defcustom wasabi-chat-history-limit 1000
+  "How many stored rows to ask for when opening a chat.
+
+wuzapi returns rows ordered by when it wrote them rather than by when
+the messages were sent, so asking for few returns an arbitrary slice of
+a conversation rather than its recent end.  Wasabi asks for plenty and
+sorts by the real timestamps, which are inside the messages themselves.
+Lower this if opening a long chat feels slow; raise it if old messages
+still show as the latest."
+  :type 'natnum
+  :group 'wasabi)
+
 (defcustom wasabi-jid-resolve-batch-size 20
   "How many phone numbers `wasabi-resolve-jids' asks about at once.
 
@@ -899,7 +911,8 @@ losing the rest."
        :client (map-elt (wasabi--state) :client)
        :request (wasabi--make-chat-history-request
                  :token wasabi-user-token
-                 :chat-jid jid)
+                 :chat-jid jid
+                 :limit wasabi-chat-history-limit)
        :on-success (lambda (response)
                      (wasabi--fetch-chat-messages
                       :jids (cdr jids)
@@ -2170,7 +2183,7 @@ Requires user TOKEN."
   `((:method . "group.list")
     (:params . ((token . ,token)))))
 
-(cl-defun wasabi--make-chat-history-request (&key token chat-jid)
+(cl-defun wasabi--make-chat-history-request (&key token chat-jid limit)
   "Instantiate a \"chat.history\" request.
 
   Required parameters:
@@ -2180,17 +2193,36 @@ Requires user TOKEN."
                - For groups: \"groupid@g.us\"
                - Special value: \"index\" returns mapping of all chats
 
+  Optional parameters:
+    LIMIT - How many rows to return.  Sent for a conversation; the
+            index ignores it.
+
   Retrieves message history for a specific chat. History must be
   enabled when creating the user account.
 
-  See: stdio.go:199, handlers.go (getMessagesHandler)"
+  Worth knowing what LIMIT selects.  wuzapi stores time.Now() in each
+  row's timestamp column, so it records when the row was written and
+  never when the message was sent, and this query is
+  \"ORDER BY timestamp DESC LIMIT n\".  So it returns the rows written
+  most recently, which during a history sync bears no relation to the
+  order the conversation happened in, and which puts anything just sent
+  from here at the front.  Asking for a small number therefore returns
+  an arbitrary slice of the chat, not its recent end.  The real times
+  are inside each message, so wasabi asks for plenty and sorts them
+  itself.
+
+  See: stdio.go:199, handlers.go (GetHistory), db.go
+  (saveMessageToHistory)"
   (unless token
     (error ":token is required"))
   (unless chat-jid
     (error ":chat-jid is required"))
-  `((:method . "chat.history")
-    (:params . ((token . ,token)
-                (chat_jid . ,chat-jid)))))
+  (let ((params `((token . ,token)
+                  (chat_jid . ,chat-jid))))
+    (when limit
+      (setq params (append params `((limit . ,limit)))))
+    `((:method . "chat.history")
+      (:params . ,params))))
 
 (cl-defun wasabi--make-chat-clear-request (&key token chat-jid)
   "Instantiate a \"chat.clear\" request.
