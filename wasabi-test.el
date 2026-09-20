@@ -834,5 +834,38 @@
     (should (equal (mapcar (lambda (m) (map-elt m :content)) sorted)
                    '("first" "middle" "last")))))
 
+(ert-deftest wasabi-test-history-set-request ()
+  (let ((request (wasabi--make-session-history-set-request
+                  :token "tok" :history 5000 :days 365)))
+    (should (equal (map-elt request :method) "session.history.set"))
+    (should (equal (map-nested-elt request '(:params history)) 5000))
+    (should (equal (map-nested-elt request '(:params days_to_sync_history)) 365)))
+  ;; Either one on its own is a valid thing to ask.
+  (let ((request (wasabi--make-session-history-set-request
+                  :token "tok" :history 5000)))
+    (should (equal (map-nested-elt request '(:params history)) 5000))
+    (should-not (map-elt (map-elt request :params) 'days_to_sync_history)))
+  (let ((request (wasabi--make-session-history-set-request
+                  :token "tok" :days 30)))
+    (should (equal (map-nested-elt request '(:params days_to_sync_history)) 30))
+    (should-not (map-elt (map-elt request :params) 'history)))
+  ;; Asking for neither says nothing.
+  (should-error (wasabi--make-session-history-set-request :token "tok"))
+  (should-error (wasabi--make-session-history-set-request :history 100)))
+
+(ert-deftest wasabi-test-new-account-keeps-more-than-a-hundred ()
+  ;; wuzapi trims a chat to this many rows on every message, by the
+  ;; order they were written, so 100 cost most of a conversation.
+  (should (> wasabi-message-history-limit 100))
+  ;; WhatsApp will not be asked for more than a year.
+  (should (<= wasabi-history-sync-days 365))
+  (let ((request (wasabi--make-admin-add-user-request
+                  :admin-token "admin" :name "me" :token "tok"
+                  :events '("Message") :history 5000
+                  :days-to-sync-history 365)))
+    (should (equal (map-elt request :method) "admin.users.add"))
+    (should (equal (map-nested-elt request '(:params history)) 5000))
+    (should (equal (map-nested-elt request '(:params days_to_sync_history)) 365))))
+
 (provide 'wasabi-test)
 ;;; wasabi-test.el ends here
