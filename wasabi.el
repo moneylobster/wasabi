@@ -453,10 +453,6 @@ For silent progression, set :silent-refresh in state before calling."
                         :message status-message
                         :silent (map-elt (wasabi--state) :silent-refresh)))
 
-  ;; Silent flag no longer necessary after ready. Clear it.
-  (when (eq status-type 'ready)
-    (map-delete (wasabi--state) :silent-refresh))
-
   (cond
    ;; Step 1: Create client
    ((not (map-elt (wasabi--state) :client))
@@ -1249,7 +1245,13 @@ The :connected flag tracks WhatsApp connection state (updated by notifications).
         ;;  ("987654321@g.us" . [...])
         ;;  ...)
         (cons :chats nil)
-        (cons :groups nil)))
+        (cons :groups nil)
+        ;; Set while a background re-fetch runs, so status changes do
+        ;; not flash over the chat list.  Declared here because
+        ;; `map-put!' cannot add a key to an alist in place: it signals
+        ;; map-not-inplace, which used to abort the sync handlers before
+        ;; they could re-fetch anything.
+        (cons :silent-refresh nil)))
 
 (cl-defun wasabi--make-status (&key type message)
   "Create a status object with TYPE and optional MESSAGE.
@@ -1273,6 +1275,11 @@ Optional SILENT suppresses visual messaging during status change."
   (unless (derived-mode-p 'wasabi-mode)
     (error "Not in a chats buffer"))
   (map-put! (wasabi--state) :status (wasabi--make-status :type type :message message))
+  ;; A background refresh is over once we are ready again.  Set to nil
+  ;; rather than deleted: `map-put!' can only update a key an alist
+  ;; already has, so removing it would break the next refresh.
+  (when (eq type 'ready)
+    (map-put! (wasabi--state) :silent-refresh nil))
   (if (eq type 'ready)
       (wasabi--update-header-line)
     (setq header-line-format nil))

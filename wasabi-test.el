@@ -588,5 +588,36 @@
                              (map-elt (car index) :last-updated))
                             (wasabi--parse-timestamp 1763380800))))))
 
+(ert-deftest wasabi-test-silent-refresh-flag-round-trips ()
+  ;; `map-put!' can only update a key an alist already has: it signals
+  ;; map-not-inplace otherwise, which used to abort the HistorySync and
+  ;; OfflineSyncCompleted handlers before they re-fetched anything.
+  (let ((buffer (generate-new-buffer "*wasabi-state-test*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (wasabi-mode)
+          (setq wasabi--state (wasabi--make-state :wasabi-buffer buffer))
+          (map-put! wasabi--state :silent-refresh t)
+          (should (map-elt wasabi--state :silent-refresh))
+          ;; Reaching ready clears it without removing the key, so the
+          ;; next sync can set it again.
+          (wasabi--set-status :type 'ready :message nil)
+          (should-not (map-elt wasabi--state :silent-refresh))
+          (map-put! wasabi--state :silent-refresh t)
+          (should (map-elt wasabi--state :silent-refresh)))
+      (kill-buffer buffer))))
+
+(ert-deftest wasabi-test-state-declares-every-key-it-puts ()
+  ;; Same trap, for every key the code writes with `map-put!'.
+  (let ((buffer (generate-new-buffer "*wasabi-state-test*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (wasabi-mode)
+          (setq wasabi--state (wasabi--make-state :wasabi-buffer buffer))
+          (dolist (key '(:client :status :connected :contacts :chats-index
+                                 :p-chat-index :chats :groups :silent-refresh))
+            (should (assq key wasabi--state))))
+      (kill-buffer buffer))))
+
 (provide 'wasabi-test)
 ;;; wasabi-test.el ends here
