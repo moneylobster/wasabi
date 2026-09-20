@@ -804,5 +804,35 @@
       (should (equal (map-elt (car index) :alt-jids)
                      '("447123456789@s.whatsapp.net"))))))
 
+(ert-deftest wasabi-test-history-request-limit ()
+  ;; wuzapi defaults to 50 rows ordered by when it wrote them, which is
+  ;; an arbitrary slice of a conversation rather than its recent end.
+  (let ((request (wasabi--make-chat-history-request
+                  :token "tok" :chat-jid "1@s.whatsapp.net" :limit 1000)))
+    (should (equal (map-elt request :method) "chat.history"))
+    (should (equal (map-nested-elt request '(:params chat_jid)) "1@s.whatsapp.net"))
+    (should (equal (map-nested-elt request '(:params limit)) 1000)))
+  ;; The index takes no limit, and asking without one is still valid.
+  (let ((request (wasabi--make-chat-history-request
+                  :token "tok" :chat-jid "index")))
+    (should-not (map-elt (map-elt request :params) 'limit))
+    (should (equal (map-nested-elt request '(:params chat_jid)) "index")))
+  (should-error (wasabi--make-chat-history-request :token "tok"))
+  (should-error (wasabi--make-chat-history-request :chat-jid "index")))
+
+(ert-deftest wasabi-test-messages-sorted-by-their-own-times ()
+  ;; The rows arrive ordered by when wuzapi wrote them, so what came
+  ;; back last is not what was said last.  Sorting has to use the time
+  ;; inside each message.
+  (let* ((messages (list '((:timestamp . "2026-08-18T20:08:11Z") (:content . "last"))
+                         '((:timestamp . "2026-06-29T21:02:39Z") (:content . "first"))
+                         '((:timestamp . "2026-07-26T22:50:08Z") (:content . "middle"))))
+         (sorted (sort (copy-sequence messages)
+                       (lambda (a b)
+                         (wasabi--timestamp-older-p (map-elt a :timestamp)
+                                                    (map-elt b :timestamp))))))
+    (should (equal (mapcar (lambda (m) (map-elt m :content)) sorted)
+                   '("first" "middle" "last")))))
+
 (provide 'wasabi-test)
 ;;; wasabi-test.el ends here
