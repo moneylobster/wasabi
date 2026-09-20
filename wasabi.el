@@ -384,6 +384,32 @@ Callers save once per batch of learning rather than per pairing."
         (dolist (entry chat-times)
           (puthash (car entry) (cdr entry) wasabi--chat-times-table))))))
 
+(defcustom wasabi-message-history-limit 5000
+  "How many messages wuzapi keeps per chat.
+
+wuzapi trims a chat to this many rows every time a message is sent or
+received, and it trims by the order rows were written rather than by
+when the messages were sent.  So a small number does not keep the most
+recent messages: it keeps whichever happened to be written last, and
+deletes the rest for good.  Wasabi asked for 100, which cost most of a
+conversation the first time anyone wrote to it.
+
+Wasabi keeps this in step with wuzapi at startup, so raising it takes
+effect on the next run.  Lowering it deletes messages, as wuzapi trims
+to the new figure."
+  :type 'natnum
+  :group 'wasabi)
+
+(defcustom wasabi-history-sync-days 365
+  "How many days of history to ask WhatsApp for, from 0 to 365.
+
+Applied when a device is paired, and only then: WhatsApp decides what
+to send at that moment and will not be asked again.  0 leaves it to
+WhatsApp, which sends rather little.  A year costs a longer first sync
+in exchange for having your conversations."
+  :type 'natnum
+  :group 'wasabi)
+
 (defcustom wasabi-chat-history-limit 1000
   "How many stored rows to ask for when opening a chat.
 
@@ -661,10 +687,17 @@ For silent progression, set :silent-refresh in state before calling."
                                         (wasabi--initialize :wasabi-buffer wasabi-buffer
                                                             :status-type 'add-user
                                                             :status-message (wasabi--make-loading-message))
-                                      ;; User exists, continue
-                                      (wasabi--initialize :wasabi-buffer wasabi-buffer
-                                                          :status-type 'check-session-status
-                                                          :status-message (wasabi--make-loading-message))))
+                                      ;; User exists.  Put its history
+                                      ;; settings right before carrying on:
+                                      ;; accounts made by earlier versions
+                                      ;; keep only 100 messages a chat.
+                                      (wasabi--send-history-config-request
+                                       :on-finished
+                                       (lambda ()
+                                         (wasabi--initialize
+                                          :wasabi-buffer wasabi-buffer
+                                          :status-type 'check-session-status
+                                          :status-message (wasabi--make-loading-message))))))
                       :on-failure (lambda (error)
                                     (wasabi--log "Couldn't load user: %s"
                                                  (or (map-elt error 'message) "unknown"))
@@ -679,7 +712,8 @@ For silent progression, set :silent-refresh in state before calling."
                                 :name (user-login-name)
                                 :token wasabi-user-token
                                 :events wasabi--event-subscriptions
-                                :history 100)
+                                :history wasabi-message-history-limit
+                                :days-to-sync-history wasabi-history-sync-days)
                       :on-success (lambda (_response)
                                     (wasabi--log "User added successfully")
                                     (wasabi--initialize :wasabi-buffer wasabi-buffer
@@ -2155,6 +2189,57 @@ Requires user TOKEN."
   `((:method . "user.contacts")
     (:params . ((token . ,token)))))
 
+(cl-defun wasabi--make-session-history-set-request (&key token history days)
+  "Instantiate a \"session.history.set\" request.
+
+  Required parameters:
+    TOKEN - User authentication token
+
+  Optional parameters:
+    HISTORY - How many messages to keep per chat
+    DAYS - How many days of history to ask WhatsApp for on pairing
+
+  HISTORY takes effect at once, and is what wuzapi trims a chat down to
+  on every message sent or received.  DAYS applies at the next pairing
+  and not before.
+
+  See: stdio.go (session.history.set), handlers.go (SetHistory)"
+  (unless token
+    (error ":token is required"))
+  (unless (or history days)
+    (error "Either :history or :days is required"))
+  (let ((params `((token . ,token))))
+    (when history
+      (setq params (append params `((history . ,history)))))
+    (when days
+      (setq params (append params `((days_to_sync_history . ,days)))))
+    `((:method . "session.history.set")
+      (:params . ,params))))
+
+(cl-defun wasabi--send-history-config-request (&key on-finished)
+  "Keep wuzapi's history settings in step with ours.
+
+Existing accounts were created asking to keep 100 messages a chat, and
+wuzapi deletes down to that on every message.  Putting it right costs
+one request at startup and saves whatever has not been trimmed yet."
+  (acp-send-request
+   :client (map-elt (wasabi--state) :client)
+   :request (wasabi--make-session-history-set-request
+             :token wasabi-user-token
+             :history wasabi-message-history-limit
+             :days wasabi-history-sync-days)
+   :on-success (lambda (response)
+                 (wasabi--log "History configured: keep %s per chat, sync %s days"
+                              (map-nested-elt response '(data History))
+                              (map-nested-elt response '(data days_to_sync_history)))
+                 (when on-finished (funcall on-finished)))
+   :on-failure (lambda (error)
+                 ;; Not fatal: an older wuzapi may not know the method, and
+                 ;; a smaller history still works, just with less of it.
+                 (wasabi--log "Couldn't configure history: %s"
+                              (or (map-elt error 'message) "unknown"))
+                 (when on-finished (funcall on-finished)))))
+
 (cl-defun wasabi--make-user-check-request (&key token phones)
   "Instantiate a \"user.check\" request.
 
@@ -2263,6 +2348,7 @@ Requires user TOKEN."
                                                     hmac-key
                                                     expiration
                                                     history
+                                                    days-to-sync-history
                                                     proxy-config)
   "Instantiate an \"admin.users.add\" request.
 
@@ -2289,6 +2375,7 @@ Optional parameters:
                                               (mapconcat #'identity events ",")
                                             events)))
                           (history . ,history)
+                          (days_to_sync_history . ,days-to-sync-history)
                           (proxyConfig . ,proxy-config))
                         (when expiration
                           `((expiration . ,expiration)))
