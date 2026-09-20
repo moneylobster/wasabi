@@ -82,6 +82,15 @@ Keys:
         (cons (cons key value)
               (assq-delete-all key wasabi-chat--chat))))
 
+(defcustom wasabi-chat-sticker-size 90
+  "Maximum width and height, in pixels, of stickers shown in a chat.
+
+Stickers are the message rather than an attachment to it, so they
+render larger than image and video thumbnails do.  Press RET on one to
+open it at full size."
+  :type 'natnum
+  :group 'wasabi)
+
 (defvar-keymap wasabi-chat-mode-map
   :doc "Keymap for `wasabi-chat-mode'."
   "q" #'wasabi-chat-quit
@@ -181,8 +190,49 @@ Returns string like \"Hello\" or \"[image]\"."
    ((map-elt p-message 'documentMessage) "[document]")
    ((map-elt p-message 'audioMessage) "[audio]")
    ((map-elt p-message 'stickerMessage)
-    ;; (message "[sticker]\n\n%s" p-message)
-    "[sticker]")
+    (wasabi--log "Sticker message arrived")
+    (let* ((thumbnail (map-nested-elt p-message '(stickerMessage pngThumbnail)))
+           ;; A sticker we cannot draw still has to render as text: a
+           ;; thumbnail Emacs chokes on must not take the chat with it.
+           (preview
+            (when thumbnail
+              (condition-case err
+                  (wasabi-chat--create-rounded-image
+                   :image-data (base64-decode-string thumbnail)
+                   :image-type 'png
+                   :max-width wasabi-chat-sticker-size
+                   :max-height wasabi-chat-sticker-size
+                   ;; Stickers are transparent cut-outs, so rounding them
+                   ;; off does nothing but clip the artwork.
+                   :corner-radius 0
+                   :padding-top 5
+                   :padding-bottom 5)
+                (error
+                 (wasabi--log "Couldn't render sticker thumbnail: %s"
+                              (error-message-string err))
+                 nil))))
+           (sticker-text (if preview
+                             (propertize "[sticker]" 'display preview)
+                           "[sticker]")))
+      ;; Store metadata as text properties
+      (add-text-properties 0 (length sticker-text)
+                           `(sticker-url ,(map-nested-elt p-message '(stickerMessage URL))
+                                         sticker-direct-path ,(map-nested-elt p-message '(stickerMessage directPath))
+                                         sticker-media-key ,(map-nested-elt p-message '(stickerMessage mediaKey))
+                                         sticker-mimetype ,(map-nested-elt p-message '(stickerMessage mimetype))
+                                         sticker-file-enc-sha256 ,(map-nested-elt p-message '(stickerMessage fileEncSHA256))
+                                         sticker-file-sha256 ,(map-nested-elt p-message '(stickerMessage fileSHA256))
+                                         sticker-file-length ,(map-nested-elt p-message '(stickerMessage fileLength))
+                                         sticker-width ,(map-nested-elt p-message '(stickerMessage width))
+                                         sticker-height ,(map-nested-elt p-message '(stickerMessage height))
+                                         sticker-thumbnail ,thumbnail)
+                           sticker-text)
+      ;; Add action to view the sticker on RET
+      (wasabi--add-action-to-text
+       sticker-text
+       (lambda ()
+         (interactive)
+         (wasabi-chat-view-sticker-at-point)))))
    ((map-elt p-message 'reactionMessage)
     ;; (message "[reaction]\n\n%s" p-message)
     "[reaction]")
@@ -1046,19 +1096,90 @@ FILE-SHA256 is used to create a unique filename."
          :on-failure (lambda (error)
                        (message "Failed to download image")))))))
 
+(defun wasabi-chat-view-sticker-at-point ()
+  "View the full sticker at point in a *Wasabi photo* buffer.
+
+Stickers are downloaded through the image endpoint: WhatsApp derives
+their media keys the same way it does an image's."
+  (interactive)
+  (unless (get-text-property (point) 'sticker-url)
+    (user-error "No sticker at point"))
+  (let* ((url (get-text-property (point) 'sticker-url))
+         (direct-path (get-text-property (point) 'sticker-direct-path))
+         (media-key (get-text-property (point) 'sticker-media-key))
+         (mimetype (or (get-text-property (point) 'sticker-mimetype) "image/webp"))
+         (file-enc-sha256 (get-text-property (point) 'sticker-file-enc-sha256))
+         (file-sha256 (get-text-property (point) 'sticker-file-sha256))
+         (file-length (get-text-property (point) 'sticker-file-length))
+         (width (get-text-property (point) 'sticker-width))
+         (height (get-text-property (point) 'sticker-height))
+         ;; Check if file already exists in cache
+         (file-id (if file-sha256
+                      (replace-regexp-in-string "[^a-zA-Z0-9]" "" file-sha256)
+                    (format "%d" (random 1000000))))
+         (extension (cond
+                     ((string-match "image/png" mimetype) ".png")
+                     ((string-match "image/gif" mimetype) ".gif")
+                     ((string-match "image/jpeg" mimetype) ".jpg")
+                     ;; Stickers are WebP unless WhatsApp says otherwise.
+                     (t ".webp")))
+         (media-dir (expand-file-name "media" (wasabi-data-dir)))
+         (cached-file (expand-file-name (concat file-id extension) media-dir)))
+    ;; Ensure media directory exists
+    (unless (file-directory-p media-dir)
+      (make-directory media-dir t))
+    (if (file-exists-p cached-file)
+        ;; File already cached, display it directly
+        (wasabi-chat--display-cached-image cached-file width height)
+      ;; Download the sticker
+      (message "Downloading sticker...")
+      (with-current-buffer (wasabi--buffer)
+        (wasabi--send-download-image-request
+         :url url
+         :direct-path direct-path
+         :media-key media-key
+         :mimetype mimetype
+         :file-enc-sha256 file-enc-sha256
+         :file-sha256 file-sha256
+         :file-length file-length
+         :on-success (lambda (response)
+                       (message "Downloading sticker... done")
+                       (wasabi-chat--save-and-display-image
+                        :data-url (map-elt response 'Data)
+                        :mimetype mimetype
+                        :file-path cached-file
+                        :width width
+                        :height height))
+         :on-failure (lambda (error)
+                       (wasabi--log "Failed to download sticker: %s"
+                                    (or (map-elt error 'message) "unknown"))
+                       (message "Failed to download sticker")))))))
+
+(defun wasabi-chat--image-type (file-path data)
+  "Return the image type of DATA, which was read from FILE-PATH.
+
+Prefers what the data itself says it is, since the extension only
+records what WhatsApp claimed the MIME type was."
+  (or (ignore-errors (image-type-from-data data))
+      (cond
+       ((string-suffix-p ".jpg" file-path) 'jpeg)
+       ((string-suffix-p ".png" file-path) 'png)
+       ((string-suffix-p ".gif" file-path) 'gif)
+       ((string-suffix-p ".webp" file-path) 'webp)
+       (t 'jpeg))))
+
 (cl-defun wasabi-chat--display-cached-image (file-path width height)
   "Display cached image from FILE-PATH."
   (let* ((image-data (with-temp-buffer
                        (set-buffer-multibyte nil)
                        (insert-file-contents-literally file-path)
                        (buffer-string)))
-         (image-type (cond
-                      ((string-suffix-p ".jpg" file-path) 'jpeg)
-                      ((string-suffix-p ".png" file-path) 'png)
-                      ((string-suffix-p ".gif" file-path) 'gif)
-                      ((string-suffix-p ".webp" file-path) 'imagemagick)
-                      (t 'jpeg)))
+         (image-type (wasabi-chat--image-type file-path image-data))
          (photo-buffer (get-buffer-create "*Wasabi photo*")))
+    (unless (image-type-available-p image-type)
+      ;; Animated stickers are WebP, which not every Emacs is built with.
+      (user-error "This Emacs cannot display %s images (saved to %s)"
+                  image-type file-path))
     (with-current-buffer photo-buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
@@ -1081,7 +1202,10 @@ FILE-SHA256 is used to create a unique filename."
           (goto-char (point-max))
           (insert (propertize "🌄" 'display image))
           (insert "\n")
-          (goto-char (point-min)))))))
+          (goto-char (point-min))))
+      ;; Animated stickers and GIFs play on their own, looping.
+      (when (image-multi-frame-p image)
+        (image-animate image nil t)))))
 
 (cl-defun wasabi-chat--save-and-display-image (&key data-url mimetype file-path width height)
   "Save image to FILE-PATH and display it.
