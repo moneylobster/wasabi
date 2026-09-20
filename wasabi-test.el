@@ -327,7 +327,7 @@
                    :chat-jid "120363000000000000@g.us"
                    :contacts nil)))
       ;; The group's name is not the sender's name.
-      (should (equal (map-elt parsed :sender-name) "Johnny"))
+      (should (equal (map-elt parsed :sender-name) "~Johnny"))
       (should (equal (map-elt parsed :content) "Hello")))))
 
 (ert-deftest wasabi-test-notification-sender-from-contacts ()
@@ -362,7 +362,7 @@
       (should (map-elt parsed :is-reaction))
       (should (equal (map-elt parsed :target-id) "ABC"))
       (should (equal (map-elt parsed :emoji) "❤️"))
-      (should (equal (map-elt parsed :sender-name) "Johnny")))))
+      (should (equal (map-elt parsed :sender-name) "~Johnny")))))
 
 (ert-deftest wasabi-test-notification-from-me ()
   (wasabi-test--with-clean-jids
@@ -427,6 +427,82 @@
         (dolist (buffer (seq-uniq buffers))
           (when (buffer-live-p buffer)
             (kill-buffer buffer)))))))
+
+(ert-deftest wasabi-test-saved-name-wins-across-jid-variants ()
+  (wasabi-test--with-clean-jids
+    (wasabi--learn-jid-alias "99988877@lid" "447123456789@s.whatsapp.net")
+    ;; The usual split: the LID entry knows only what they call
+    ;; themselves, the phone number entry carries the name we saved.
+    (let ((contacts (list (cons (intern "99988877@lid")
+                                '((:push-name . "Johnny")))
+                          (cons (intern "447123456789@s.whatsapp.net")
+                                '((:full-name . "John Smith"))))))
+      (should (equal (wasabi--contact-display-name "99988877@lid" contacts)
+                     "John Smith"))
+      (should (equal (wasabi--contact-display-name "447123456789@s.whatsapp.net"
+                                                   contacts)
+                     "John Smith")))))
+
+(ert-deftest wasabi-test-push-name-marked-when-nothing-saved ()
+  (wasabi-test--with-clean-jids
+    (let ((contacts (list (cons (intern "99988877@lid")
+                                '((:push-name . "Johnny"))))))
+      ;; Nobody we saved, so show what they call themselves, marked.
+      (should (equal (wasabi--contact-display-name "99988877@lid" contacts)
+                     "~Johnny")))))
+
+(ert-deftest wasabi-test-push-name-marking ()
+  (should (equal (wasabi--push-name "Johnny") "~Johnny"))
+  ;; Already marked names are left alone.
+  (should (equal (wasabi--push-name "~Johnny") "~Johnny"))
+  (should-not (wasabi--push-name ""))
+  (should-not (wasabi--push-name nil)))
+
+(ert-deftest wasabi-test-chat-index-prefers-saved-name-over-push-name ()
+  (wasabi-test--with-clean-jids
+    (wasabi--learn-jid-alias "99988877@lid" "447123456789@s.whatsapp.net")
+    (let* ((contacts (list (cons (intern "99988877@lid")
+                                 '((:push-name . "Johnny")))
+                           (cons (intern "447123456789@s.whatsapp.net")
+                                 '((:full-name . "John Smith")))))
+           (index (wasabi--parse-chat-index
+                   (list (wasabi-test--index-entry "99988877@lid"
+                                                   "2025-11-11T12:00:00Z"))
+                   contacts nil)))
+      (should (equal (map-elt (car index) :display-name) "John Smith")))))
+
+(ert-deftest wasabi-test-chat-index-falls-back-to-marked-push-name ()
+  (wasabi-test--with-clean-jids
+    (let* ((contacts (list (cons (intern "447123456789@s.whatsapp.net")
+                                 '((:push-name . "Johnny")))))
+           (index (wasabi--parse-chat-index
+                   (list (wasabi-test--index-entry "447123456789@s.whatsapp.net"
+                                                   "2025-11-11T12:00:00Z"))
+                   contacts nil)))
+      ;; Someone we never saved: their own name beats a bare number.
+      (should (equal (map-elt (car index) :display-name) "~Johnny")))))
+
+;;; Gathering a chat recorded under more than one JID
+
+(ert-deftest wasabi-test-dedupe-messages ()
+  (let ((messages (list '((message_id . "A") (text_content . "one"))
+                        '((message_id . "B") (text_content . "two"))
+                        '((message_id . "A") (text_content . "one again")))))
+    (should (equal (mapcar (lambda (m) (map-elt m 'message_id))
+                           (wasabi--dedupe-messages messages))
+                   '("A" "B")))))
+
+(ert-deftest wasabi-test-dedupe-messages-keeps-unidentified ()
+  ;; No message_id is no reason to drop a message.
+  (let ((messages (list '((text_content . "one"))
+                        '((text_content . "two")))))
+    (should (equal (length (wasabi--dedupe-messages messages)) 2))))
+
+(ert-deftest wasabi-test-dedupe-messages-accepts-a-vector ()
+  (should (equal (length (wasabi--dedupe-messages
+                          (vector '((message_id . "A"))
+                                  '((message_id . "B")))))
+                 2)))
 
 (provide 'wasabi-test)
 ;;; wasabi-test.el ends here
