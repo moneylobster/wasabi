@@ -761,7 +761,10 @@ Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB."
                   (:timestamp . ,(format-time-string "%Y-%m-%dT%H:%M:%S%z"
                                                      (or (map-elt response 'Timestamp)
                                                          (current-time))))
-                  (:content . ,(wasabi-chat--sent-image-content file caption))))))))))))
+                  (:content . ,(wasabi-chat--sent-image-content file caption))))
+               ;; An image in reply is as good as a message for having
+               ;; read what they sent.
+               (wasabi-chat--send-read-receipts)))))))))
 
 (defun wasabi-chat-refresh ()
   "Refresh the current chat buffer by fetching new messages."
