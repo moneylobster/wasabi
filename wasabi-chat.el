@@ -687,23 +687,251 @@ Messages with reactions will have a :reactions field."
   (let* ((reactions (wasabi-chat--parse-reactions p-messages :contacts contacts))
          (parsed (delq nil
                        (mapcar (lambda (p-msg)
-                                 (when-let ((message
-                                             (wasabi-chat--parse-message p-msg
-                                                                         :chat-jid chat-jid
-                                                                         :contact-name contact-name
-                                                                         :contacts contacts
-                                                                         :reactions reactions)))
-                                   (append message
-                                           (wasabi-chat--receipt-fields p-msg chat-jid)
-                                           (wasabi-chat--reply-fields p-msg))))
+                                 (if-let ((change (wasabi-chat--stored-change p-msg)))
+                                     ;; Not a message: a note against one.
+                                     (progn (wasabi-chat--record-change change) nil)
+                                   (when-let ((message
+                                               (wasabi-chat--parse-message p-msg
+                                                                           :chat-jid chat-jid
+                                                                           :contact-name contact-name
+                                                                           :contacts contacts
+                                                                           :reactions reactions)))
+                                     (append message
+                                             (wasabi-chat--receipt-fields p-msg chat-jid)
+                                             (wasabi-chat--reply-fields p-msg)))))
                                (append p-messages nil)))))
     ;; Parsing learns JID pairings from each message's Info; persist
     ;; whatever this batch turned up, in one go.
     (wasabi--save-jid-aliases)
-    (sort parsed
-          (lambda (a b)
-            (wasabi--timestamp-older-p (map-elt a :timestamp)
-                                       (map-elt b :timestamp))))))
+    (wasabi-chat--save-changes)
+    (wasabi-chat--attach-changes
+     (sort parsed
+           (lambda (a b)
+             (wasabi--timestamp-older-p (map-elt a :timestamp)
+                                        (map-elt b :timestamp)))))))
+
+;;; Edits and deletions
+
+(defface wasabi-chat-deleted
+  '((t :inherit error :slant italic :weight normal))
+  "Face for the note that a message has been deleted."
+  :group 'wasabi)
+
+(defface wasabi-chat-edited
+  '((t :inherit font-lock-doc-face :slant italic))
+  "Face for the note of how a message was edited."
+  :group 'wasabi)
+
+(defvar wasabi-chat--changes nil
+  "Hash table of message ID to the edits and deletion it has seen.
+Each value is an alist of :deleted, the time, and :edits, a list of
+\(TIME . TEXT).  Kept on disk: wuzapi stores deletions, but never
+edits.")
+
+(defvar wasabi-chat--changes-dirty nil
+  "Non-nil when `wasabi-chat--changes' has yet to be written to disk.")
+
+(defun wasabi-chat--changes-file ()
+  "Return the file keeping the edits and deletions seen."
+  (expand-file-name "message-changes.eld" (wasabi-data-dir)))
+
+(defun wasabi-chat--changes ()
+  "Return the table of changes, loading it from disk the first time."
+  (unless wasabi-chat--changes
+    (setq wasabi-chat--changes (make-hash-table :test 'equal))
+    (ignore-errors
+      (when (file-exists-p (wasabi-chat--changes-file))
+        (dolist (entry (with-temp-buffer
+                         (insert-file-contents (wasabi-chat--changes-file))
+                         (read (current-buffer))))
+          (puthash (car entry) (cdr entry) wasabi-chat--changes)))))
+  wasabi-chat--changes)
+
+(defun wasabi-chat--save-changes ()
+  "Write the table of changes to disk, if anything is new."
+  (when wasabi-chat--changes-dirty
+    (setq wasabi-chat--changes-dirty nil)
+    (ignore-errors
+      (let ((entries '()))
+        (maphash (lambda (id changes) (push (cons id changes) entries))
+                 (wasabi-chat--changes))
+        (with-temp-file (wasabi-chat--changes-file)
+          (let ((print-length nil) (print-level nil))
+            (prin1 entries (current-buffer))))))))
+
+(defun wasabi-chat--edit-text (p-message)
+  "Return the text of protocol P-MESSAGE, what an edit changed it to."
+  (let ((conversation (map-elt p-message 'conversation)))
+    (cond
+     ((and (stringp conversation) (not (string-empty-p conversation)))
+      conversation)
+     ((map-nested-elt p-message '(extendedTextMessage text)))
+     ((map-nested-elt p-message '(imageMessage caption)))
+     ((map-nested-elt p-message '(videoMessage caption)))
+     (t "…"))))
+
+(defun wasabi-chat--change (p-message p-info)
+  "Return how protocol P-MESSAGE changes an earlier message, or nil.
+
+An alist of :target, the ID of the message it changes, :kind, either
+`deleted' or `edited', :time, from P-INFO, and for an edit :text."
+  (when-let* ((protocol (map-elt p-message 'protocolMessage))
+              ((consp protocol))
+              (target (map-nested-elt protocol '(key ID)))
+              ((stringp target))
+              ((not (string-empty-p target))))
+    (let ((type (map-elt protocol 'type))
+          (time (map-elt p-info 'Timestamp)))
+      ;; The type arrives as its number or its name, depending on who
+      ;; marshalled it.
+      (cond
+       ((member type '(0 "REVOKE"))
+        (list (cons :target target) (cons :kind 'deleted) (cons :time time)))
+       ((member type '(14 "MESSAGE_EDIT"))
+        (list (cons :target target) (cons :kind 'edited) (cons :time time)
+              (cons :text (wasabi-chat--edit-text
+                           (map-elt protocol 'editedMessage)))))))))
+
+(defun wasabi-chat--stored-change (p-message)
+  "Return how stored P-MESSAGE changes an earlier message, or nil.
+wuzapi stores a deletion as a row of its own, of type \"delete\", with
+the deleted message's ID as its text."
+  (let* ((data-json (map-elt p-message 'data_json))
+         (p-data (when (and (stringp data-json) (not (string-empty-p data-json)))
+                   (ignore-errors
+                     (json-parse-string data-json :object-type 'alist
+                                        :null-object nil :false-object nil)))))
+    (or (and p-data
+             (wasabi-chat--change (map-elt p-data 'Message) (map-elt p-data 'Info)))
+        (when (equal (map-elt p-message 'message_type) "delete")
+          (let ((target (map-elt p-message 'text_content)))
+            (when (and (stringp target) (not (string-empty-p target)))
+              (list (cons :target target)
+                    (cons :kind 'deleted)
+                    (cons :time (map-elt p-message 'timestamp)))))))))
+
+(defun wasabi-chat--record-change (change)
+  "Record CHANGE against the message it changes."
+  (let* ((table (wasabi-chat--changes))
+         (target (map-elt change :target))
+         (before (gethash target table))
+         (after (copy-alist before)))
+    (pcase (map-elt change :kind)
+      ('deleted
+       (unless (assq :deleted after)
+         (push (cons :deleted (map-elt change :time)) after)))
+      ('edited
+       (let ((edit (cons (map-elt change :time) (map-elt change :text)))
+             (edits (cdr (assq :edits after))))
+         (unless (member edit edits)
+           (setq after (cons (cons :edits
+                                   (sort (append edits (list edit))
+                                         (lambda (a b)
+                                           (string< (format "%s" (car a))
+                                                    (format "%s" (car b))))))
+                             (assq-delete-all :edits after)))))))
+    (unless (equal before after)
+      (puthash target after table)
+      (setq wasabi-chat--changes-dirty t))))
+
+(defun wasabi-chat--attach-changes (messages)
+  "Return MESSAGES, each carrying the changes recorded against it."
+  (let ((table (wasabi-chat--changes)))
+    (mapcar (lambda (message)
+              (if-let ((changes (and (map-elt message :message-id)
+                                     (gethash (map-elt message :message-id) table))))
+                  (cons (cons :changes changes)
+                        (assq-delete-all :changes (copy-alist message)))
+                message))
+            messages)))
+
+(defun wasabi-chat--change-time (time sent-at)
+  "Return TIME for an annotation: the hour, or the date too when it is
+not the day the message was SENT-AT."
+  (when-let ((parsed (and (stringp time)
+                          (ignore-errors (parse-iso8601-time-string time)))))
+    (let ((sent (and (stringp sent-at)
+                     (ignore-errors (parse-iso8601-time-string sent-at)))))
+      (format-time-string (if (and sent
+                                   (equal (format-time-string "%F" sent)
+                                          (format-time-string "%F" parsed)))
+                              "%H:%M"
+                            "%b %-d %H:%M")
+                          parsed))))
+
+(defun wasabi-chat--render-changes (changes sent-at)
+  "Return the annotations for CHANGES to a message SENT-AT.
+
+\(DELETED) after it, and a line of (EDITED TIME: TEXT) under it for each
+edit.  Marked with `wasabi-annotation', and set in their own faces, to
+tell them from the message itself."
+  (concat
+   (when (assq :deleted changes)
+     (concat " " (propertize "(DELETED)"
+                             'face 'wasabi-chat-deleted
+                             'wasabi-annotation t)))
+   (mapconcat (lambda (edit)
+                (let ((time (wasabi-chat--change-time (car edit) sent-at)))
+                  (concat "\n"
+                          (propertize (if time
+                                          (format "(EDITED %s: %s)" time (cdr edit))
+                                        (format "(EDITED: %s)" (cdr edit)))
+                                      'face 'wasabi-chat-edited
+                                      'wasabi-annotation t))))
+              (cdr (assq :edits changes))
+              "")))
+
+(defun wasabi-chat--apply-change (target-id)
+  "Show the changes recorded against TARGET-ID, if this chat has it."
+  (let ((messages (map-elt wasabi-chat--chat :messages)))
+    (when-let ((index (seq-position messages target-id
+                                    (lambda (message id)
+                                      (equal (map-elt message :message-id) id)))))
+      (let ((updated (car (wasabi-chat--attach-changes (list (nth index messages))))))
+        (wasabi-chat--update-chat :messages
+                                  (append (seq-take messages index)
+                                          (list updated)
+                                          (seq-drop messages (1+ index))))
+        (wasabi-chat--rerender-message updated)))))
+
+(defun wasabi-chat--render (message)
+  "Render internal MESSAGE as it sits in this chat."
+  (wasabi-chat--render-message
+   :sender-name (map-elt message :sender-name)
+   :timestamp (map-elt message :timestamp)
+   :content (map-elt message :content)
+   :max-sender-width (map-elt wasabi-chat--chat :max-sender-width)
+   :reactions (map-elt message :reactions)
+   :message-id (map-elt message :message-id)
+   :quote (map-elt message :quote)
+   :changes (map-elt message :changes)))
+
+(defun wasabi-chat--rerender-message (message)
+  "Draw MESSAGE again in place, keeping the rest of the chat as it is.
+Unlike a refresh, this leaves whatever is being typed alone."
+  (let ((inhibit-read-only t)
+        (id (map-elt message :message-id)))
+    (save-excursion
+      (goto-char (point-min))
+      (when-let* ((match (text-property-search-forward 'wasabi-message-id id #'equal))
+                  (sender-start (prop-match-beginning match)))
+        (goto-char sender-start)
+        (beginning-of-line)
+        (let* ((start (point))
+               (after-sender (next-single-property-change sender-start 'wasabi-sender))
+               (next-sender (when after-sender
+                              (next-single-property-change after-sender 'wasabi-sender)))
+               ;; Up to the next message's line, or the prompt, taking in
+               ;; the blank line each message ends with.
+               (end (if next-sender
+                        (save-excursion
+                          (goto-char next-sender)
+                          (line-beginning-position))
+                      (or wasabi-chat--prompt-marker (point-max)))))
+          (delete-region start end)
+          (goto-char start)
+          (insert (wasabi-chat--render message))
+          (put-text-property start (point) 'read-only t))))))
 
 (defun wasabi-chat--calculate-max-sender-width (messages)
   "Calculate maximum sender name width from internal MESSAGES for alignment."
@@ -1227,7 +1455,7 @@ MESSAGES is a list of already-parsed internal message alists."
   (wasabi-chat--load-stickers)
   (wasabi-chat--send-read-receipts))
 
-(cl-defun wasabi-chat--render-message (&key sender-name timestamp content max-sender-width reactions message-id ((:quote quoted)))
+(cl-defun wasabi-chat--render-message (&key sender-name timestamp content max-sender-width reactions message-id ((:quote quoted)) changes)
   "Render a single internal message.
 SENDER-NAME is the display name of the sender.
 TIMESTAMP is the ISO8601 timestamp string.
@@ -1235,7 +1463,8 @@ CONTENT is the display content (already parsed, may include text properties).
 MAX-SENDER-WIDTH is used for padding alignment.
 REACTIONS is a list of reaction alists with :emoji and :sender keys.
 MESSAGE-ID is used to tag the rendered message for later updates.
-QUOTE, when the message is a reply, is the quote of what it replies to."
+QUOTE, when the message is a reply, is the quote of what it replies to.
+CHANGES are the edits and deletion recorded against it, shown as notes."
   (let* ((col1-width max-sender-width)
          (is-from-me (string= sender-name "Me"))
          (sender (propertize sender-name
@@ -1268,7 +1497,9 @@ QUOTE, when the message is a reply, is the quote of what it replies to."
             (when quoted
               (concat (wasabi-chat--render-quote quoted)
                       "\n" (make-string col1-width ?\s) " "))
-            (string-replace "\n" (concat "\n " (make-string col1-width ?\s)) content)
+            (string-replace "\n" (concat "\n " (make-string col1-width ?\s))
+                            (concat content
+                                    (wasabi-chat--render-changes changes timestamp)))
             ;; Add reactions below the message
             (when reactions
               (concat "\n"
@@ -1299,7 +1530,8 @@ MESSAGES is a list of alists with :sender-name, :timestamp, :content."
               :max-sender-width max-sender-width
               :reactions (map-elt msg :reactions)
               :message-id (map-elt msg :message-id)
-              :quote (map-elt msg :quote)))
+              :quote (map-elt msg :quote)
+              :changes (map-elt msg :changes)))
            messages)))
     (let ((start (point)))
       (insert "\n" (mapconcat #'identity message-lines))
@@ -1338,7 +1570,8 @@ Updates :messages list and :max-sender-width in chat state."
                :max-sender-width (map-elt wasabi-chat--chat :max-sender-width)
                :reactions (map-elt message :reactions)
                :message-id (map-elt message :message-id)
-               :quote (map-elt message :quote)))
+               :quote (map-elt message :quote)
+               :changes (map-elt message :changes)))
       (put-text-property start (point) 'read-only t))
     (wasabi-chat--setup-prompt)
     ;; Restore saved input
@@ -1407,7 +1640,8 @@ Finds the message in :messages, updates it, and re-renders just that message."
                          :max-sender-width (map-elt wasabi-chat--chat :max-sender-width)
                          :reactions (map-elt updated-msg :reactions)
                          :message-id (map-elt updated-msg :message-id)
-                         :quote (map-elt updated-msg :quote)))
+                         :quote (map-elt updated-msg :quote)
+                         :changes (map-elt updated-msg :changes)))
                 ;; Ensure newline before prompt.
                 (unless next-sender
                   (insert "\n\n")))))))

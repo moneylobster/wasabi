@@ -1337,33 +1337,42 @@ Calls ON-FAILURE with error if download fails."
                                ;; Trigger re-fetching index to show recent
                                ;; chats and groups with latest order.
                                (wasabi--send-chat-history-request :chat-jid "index")
-                               (let* ((chat-buffer (wasabi-chat--find-buffer chat-jid))
-                                      (contact-name
-                                       (or (when chat-buffer
-                                             (map-elt (buffer-local-value 'wasabi-chat--chat
-                                                                          chat-buffer)
-                                                      :contact-name))
-                                           (wasabi--chat-display-name chat-jid)))
-                                      (parsed (wasabi-chat--parse-notification
-                                               :p-message p-message
-                                               :p-info p-info
-                                               :contact-name contact-name
-                                               :chat-jid chat-jid
-                                               :contacts contacts)))
-                                 (when parsed
-                                   ;; Notify whether or not the chat is open, but
-                                   ;; never for our own messages, which echo back
-                                   ;; from other devices.
-                                   (unless (map-elt p-info 'IsFromMe)
-                                     (wasabi--notify parsed :chat-buffer chat-buffer))
-                                   (when chat-buffer
-                                     (with-current-buffer chat-buffer
-                                       (if (map-elt parsed :is-reaction)
-                                           (wasabi-chat--add-reaction
-                                            :target-id (map-elt parsed :target-id)
-                                            :emoji (map-elt parsed :emoji)
-                                            :sender (map-elt parsed :sender-name))
-                                         (wasabi-chat--append-message parsed))))))))
+                               (if-let ((change (wasabi-chat--change p-message p-info)))
+                                   ;; An edit or a deletion of an earlier message, rather
+                                   ;; than a message of its own: annotate that one.
+                                   (progn
+                                     (wasabi-chat--record-change change)
+                                     (wasabi-chat--save-changes)
+                                     (when-let ((chat-buffer (wasabi-chat--find-buffer chat-jid)))
+                                       (with-current-buffer chat-buffer
+                                         (wasabi-chat--apply-change (map-elt change :target)))))
+                                 (let* ((chat-buffer (wasabi-chat--find-buffer chat-jid))
+                                        (contact-name
+                                         (or (when chat-buffer
+                                               (map-elt (buffer-local-value 'wasabi-chat--chat
+                                                                            chat-buffer)
+                                                        :contact-name))
+                                             (wasabi--chat-display-name chat-jid)))
+                                        (parsed (wasabi-chat--parse-notification
+                                                 :p-message p-message
+                                                 :p-info p-info
+                                                 :contact-name contact-name
+                                                 :chat-jid chat-jid
+                                                 :contacts contacts)))
+                                   (when parsed
+                                     ;; Notify whether or not the chat is open, but
+                                     ;; never for our own messages, which echo back
+                                     ;; from other devices.
+                                     (unless (map-elt p-info 'IsFromMe)
+                                       (wasabi--notify parsed :chat-buffer chat-buffer))
+                                     (when chat-buffer
+                                       (with-current-buffer chat-buffer
+                                         (if (map-elt parsed :is-reaction)
+                                             (wasabi-chat--add-reaction
+                                              :target-id (map-elt parsed :target-id)
+                                              :emoji (map-elt parsed :emoji)
+                                              :sender (map-elt parsed :sender-name))
+                                           (wasabi-chat--append-message parsed)))))))))
                             ((equal (map-elt notification 'method) "HistorySync")
                              (wasabi--log "HistorySync received")
                              ;; Batches keep arriving for a while; each one
