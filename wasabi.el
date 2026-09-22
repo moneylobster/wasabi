@@ -698,23 +698,34 @@ Calls ON-FAILURE with error if download fails."
                                ;; Trigger re-fetching index to show recent
                                ;; chats and groups with latest order.
                                (wasabi--send-chat-history-request :chat-jid "index")
-                               (dolist (buffer (buffer-list))
-                                 (with-current-buffer buffer
-                                   (when-let ((message (and (derived-mode-p 'wasabi-chat-mode)
-                                                            (equal (map-elt wasabi-chat--chat :chat-jid) chat-jid)
-                                                            (wasabi-chat--parse-notification
-                                                             :p-message p-message
-                                                             :p-info p-info
-                                                             :contact-name (map-elt wasabi-chat--chat :contact-name)
-                                                             :chat-jid chat-jid
-                                                             :contacts contacts))))
-									 (wasabi--notify message)
-                                     (if (map-elt message :is-reaction)
-                                         (wasabi-chat--add-reaction
-                                          :target-id (map-elt message :target-id)
-                                          :emoji (map-elt message :emoji)
-                                          :sender (map-elt message :sender-name))
-                                       (wasabi-chat--append-message message)))))))
+                               (if-let ((change (wasabi-chat--change p-message p-info)))
+                                   ;; An edit or a deletion of an earlier message, rather
+                                   ;; than a message of its own: annotate that one.
+                                   (progn
+                                     (wasabi-chat--record-change change)
+                                     (wasabi-chat--save-changes)
+                                     (dolist (buffer (buffer-list))
+                                       (with-current-buffer buffer
+                                         (when (and (derived-mode-p 'wasabi-chat-mode)
+                                                    (equal (map-elt wasabi-chat--chat :chat-jid) chat-jid))
+                                           (wasabi-chat--apply-change (map-elt change :target))))))
+                                 (dolist (buffer (buffer-list))
+                                   (with-current-buffer buffer
+                                     (when-let ((message (and (derived-mode-p 'wasabi-chat-mode)
+                                                              (equal (map-elt wasabi-chat--chat :chat-jid) chat-jid)
+                                                              (wasabi-chat--parse-notification
+                                                               :p-message p-message
+                                                               :p-info p-info
+                                                               :contact-name (map-elt wasabi-chat--chat :contact-name)
+                                                               :chat-jid chat-jid
+                                                               :contacts contacts))))
+  									 (wasabi--notify message)
+                                       (if (map-elt message :is-reaction)
+                                           (wasabi-chat--add-reaction
+                                            :target-id (map-elt message :target-id)
+                                            :emoji (map-elt message :emoji)
+                                            :sender (map-elt message :sender-name))
+                                         (wasabi-chat--append-message message))))))))
                             ((equal (map-elt notification 'method) "HistorySync")
                              (wasabi--log "HistorySync received")
                              (wasabi--log "HistorySync: current-buffer=%s, major-mode=%s" (current-buffer) major-mode)
