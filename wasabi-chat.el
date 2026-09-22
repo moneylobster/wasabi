@@ -78,7 +78,7 @@ Keys:
   "p" #'wasabi-chat-previous-message
   "g" #'wasabi-chat-refresh
   "RET" #'wasabi-chat-send-input
-  "C-c C-a" #'wasabi-chat-send-image
+  "C-c C-a" #'wasabi-chat-attach
   "C-a" #'wasabi-chat-beginning-of-line
   "TAB" #'wasabi-chat-next-actionable
   "S-TAB" #'wasabi-chat-previous-actionable
@@ -626,10 +626,12 @@ what it was rather than showing as a blank line."
       (format "[%s]" type))
      (t "[message]"))))
 
-(defun wasabi-chat-send-image (file &optional caption)
+(defun wasabi-chat-send-image (file &optional caption delete-after)
   "Send the image FILE to this chat, with an optional CAPTION.
 
-Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB."
+Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB.
+DELETE-AFTER, when non-nil, deletes FILE once the send is done with it,
+for a file made only to be sent."
   (interactive
    (progn
      (unless (derived-mode-p 'wasabi-chat-mode)
@@ -655,10 +657,14 @@ Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB."
          :caption caption
          :on-failure (lambda (error)
                        (message "Failed to send image: %s"
-                                (or (map-elt error 'message) "unknown error")))
+                                (or (map-elt error 'message) "unknown error"))
+                       (when delete-after
+                         (ignore-errors (delete-file file))))
          :on-success
          (lambda (response)
            (message "Sent %s" (file-name-nondirectory file))
+           (let ((shown (or (wasabi-chat--keep-sent-image file (map-elt response 'Id))
+                            file)))
            (when (buffer-live-p chat-buffer)
              (with-current-buffer chat-buffer
                (wasabi-chat--append-message
@@ -666,11 +672,150 @@ Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB."
                   (:timestamp . ,(format-time-string "%Y-%m-%dT%H:%M:%S%z"
                                                      (or (map-elt response 'Timestamp)
                                                          (current-time))))
-                  (:content . ,(wasabi-chat--sent-image-content
-                                  (or (wasabi-chat--keep-sent-image
-                                       file (map-elt response 'Id))
-                                      file)
-                                  caption))))))))))))
+                  (:content . ,(wasabi-chat--sent-image-content shown caption)))))))
+           ;; The kept copy is what the chat draws from now.
+           (when delete-after
+             (ignore-errors (delete-file file)))))))))
+
+(defconst wasabi-chat--w32-clipboard-script
+  "[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$out = '%s'
+$image = [Windows.Forms.Clipboard]::GetImage()
+if ($image -ne $null) {
+  $image.Save($out, [Drawing.Imaging.ImageFormat]::Png)
+  Write-Output ('IMAGE ' + $out)
+  exit 0
+}
+foreach ($file in [Windows.Forms.Clipboard]::GetFileDropList()) {
+  if ($file -match '\\.(png|jpe?g|gif)$') {
+    Write-Output ('FILE ' + $file)
+    exit 0
+  }
+}
+exit 1"
+  "PowerShell that finds an image on the Windows clipboard.
+Either a picture, saved as a PNG to the path put in place of %s, or an
+image file copied in Explorer.  Prints which, and exits 1 for neither.
+Emacs itself can only read text from the clipboard on Windows.")
+
+(defun wasabi-chat--png-file-p (file)
+  "Return non-nil when FILE is a non-empty PNG."
+  (and (file-readable-p file)
+       (with-temp-buffer
+         (set-buffer-multibyte nil)
+         (insert-file-contents-literally file nil 0 8)
+         (equal (buffer-string) "\x89PNG\r\n\x1a\n"))))
+
+(defun wasabi-chat--clipboard-image-w32 (png)
+  "Find an image on the Windows clipboard, saving a picture to PNG.
+Returns (FILE . TEMPORARY), or nil if there is no image to be had."
+  (when (executable-find "powershell")
+    (let* ((script (format wasabi-chat--w32-clipboard-script
+                           (string-replace "'" "''" (convert-standard-filename png))))
+           ;; Encoded, so that nothing in the script or path needs quoting.
+           (encoded (base64-encode-string (encode-coding-string script 'utf-16le) t))
+           (coding-system-for-read 'utf-8)
+           (output (with-temp-buffer
+                     (and (zerop (call-process "powershell" nil t nil
+                                               "-NoProfile" "-NonInteractive" "-STA"
+                                               "-EncodedCommand" encoded))
+                          (string-trim (buffer-string))))))
+      (cond
+       ((and output (string-prefix-p "IMAGE " output) (wasabi-chat--png-file-p png))
+        (cons png t))
+       ((and output (string-prefix-p "FILE " output))
+        (let ((file (string-remove-prefix "FILE " output)))
+          (when (file-readable-p file)
+            (cons file nil))))))))
+
+(defun wasabi-chat--clipboard-image-gui (png)
+  "Save the clipboard's image to PNG through Emacs, where it can.
+Returns (PNG . t), or nil."
+  (when-let ((data (ignore-errors (gui-get-selection 'CLIPBOARD 'image/png))))
+    (when (and (stringp data) (> (length data) 0))
+      (let ((coding-system-for-write 'binary))
+        (with-temp-file png
+          (set-buffer-multibyte nil)
+          (insert (if (multibyte-string-p data)
+                      (encode-coding-string data 'binary)
+                    data))))
+      (when (wasabi-chat--png-file-p png)
+        (cons png t)))))
+
+(defun wasabi-chat--clipboard-image-command (png)
+  "Save the clipboard's image to PNG with whichever tool is installed.
+Returns (PNG . t), or nil."
+  (when (seq-some
+         (lambda (command)
+           (when (executable-find (car command))
+             (ignore-errors
+               (if (equal (car command) "pngpaste")
+                   ;; pngpaste writes the file itself.
+                   (zerop (call-process "pngpaste" nil nil nil png))
+                 (zerop (apply #'call-process (car command) nil (list :file png) nil
+                               (cdr command)))))))
+         '(("wl-paste" "--no-newline" "--type" "image/png")
+           ("xclip" "-selection" "clipboard" "-target" "image/png" "-out")
+           ("pngpaste")))
+    (when (wasabi-chat--png-file-p png)
+      (cons png t))))
+
+(defun wasabi-chat--clipboard-image ()
+  "Return (FILE . TEMPORARY) for the image on the clipboard, or nil.
+FILE is a picture saved for sending, and TEMPORARY, or an image file
+copied in a file manager, which is sent as it is."
+  (let ((png (make-temp-file "wasabi-clipboard-" nil ".png")))
+    (or (if (memq system-type '(windows-nt cygwin))
+            (wasabi-chat--clipboard-image-w32 png)
+          (or (wasabi-chat--clipboard-image-gui png)
+              (wasabi-chat--clipboard-image-command png)))
+        (progn
+          (ignore-errors (delete-file png))
+          nil))))
+
+(defun wasabi-chat--read-caption-for (file)
+  "Ask for a caption for FILE, showing it so it is not sent unseen."
+  (read-string
+   (concat (when (display-images-p)
+             (when-let ((preview (ignore-errors
+                                   (create-image file nil nil
+                                                 :max-width 240 :max-height 160))))
+               (concat (propertize " " 'display preview) "\n")))
+           (format "Send this to %s?  Caption (optional, C-g to cancel): "
+                   (or (map-elt wasabi-chat--chat :contact-name) "this chat")))))
+
+(defun wasabi-chat--send-found-image (found)
+  "Send FOUND, a (FILE . TEMPORARY) from the clipboard, once seen.
+A TEMPORARY file is deleted afterwards, or at once if not sent."
+  (let ((file (car found))
+        (temporary (cdr found)))
+    (condition-case nil
+        (wasabi-chat-send-image file (wasabi-chat--read-caption-for file) temporary)
+      (quit
+       (when temporary (ignore-errors (delete-file file)))
+       (message "Not sent")))))
+
+(defun wasabi-chat-send-clipboard-image ()
+  "Send the image on the clipboard to this chat.
+A copied picture, a screenshot say, or an image file copied in a file
+manager.  Shows it before sending, with a prompt for a caption."
+  (interactive)
+  (unless (derived-mode-p 'wasabi-chat-mode)
+    (user-error "Open a chat to send an image to"))
+  (wasabi-chat--send-found-image
+   (or (wasabi-chat--clipboard-image)
+       (user-error "No image on the clipboard"))))
+
+(defun wasabi-chat-attach (&optional pick)
+  "Send the clipboard's image if there is one, or pick an image file.
+With a prefix argument PICK, always pick a file."
+  (interactive "P")
+  (unless (derived-mode-p 'wasabi-chat-mode)
+    (user-error "Open a chat to send an image to"))
+  (if-let ((found (unless pick (wasabi-chat--clipboard-image))))
+      (wasabi-chat--send-found-image found)
+    (call-interactively #'wasabi-chat-send-image)))
 
 (defun wasabi-chat-refresh ()
   "Refresh the current chat buffer by fetching new messages."

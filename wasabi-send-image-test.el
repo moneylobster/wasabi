@@ -125,8 +125,9 @@
                  "[image]")))
 
 (ert-deftest wasabi-send-image-test-bound-in-chats ()
+  ;; Attach: the clipboard's image if there is one, else pick a file.
   (should (eq (lookup-key wasabi-chat-mode-map (kbd "C-c C-a"))
-              #'wasabi-chat-send-image)))
+              #'wasabi-chat-attach)))
 
 (ert-deftest wasabi-send-image-test-keeps-a-copy ()
   (let* ((wasabi-data-dir (make-temp-file "wasabi-test" t))
@@ -213,6 +214,209 @@
                       'image)))
       (kill-buffer chat-buffer)
       (kill-buffer wasabi-buffer))))
+
+;;; From the clipboard
+
+(defmacro wasabi-send-image-test--in-chat (&rest body)
+  "Run BODY in a chat buffer, with a *Wasabi* buffer alongside."
+  (declare (indent 0))
+  `(let ((wasabi-buffer (get-buffer-create "*Wasabi*"))
+         (chat-buffer (generate-new-buffer "*wasabi-send-image-test*")))
+     (unwind-protect
+         (with-current-buffer chat-buffer
+           (wasabi-chat-mode)
+           (setq wasabi-chat--chat
+                 (wasabi-chat--make-chat :chat-jid "1@s.whatsapp.net"
+                                         :contact-name "John"))
+           ,@body)
+       (kill-buffer chat-buffer)
+       (kill-buffer wasabi-buffer))))
+
+(ert-deftest wasabi-send-image-test-png-check ()
+  (should (wasabi-chat--png-file-p (wasabi-send-image-test--write "a.png")))
+  (let ((not-png (make-temp-file "wasabi-test" nil ".png" "just text")))
+    (should-not (wasabi-chat--png-file-p not-png)))
+  (should-not (wasabi-chat--png-file-p "/no/such/file.png")))
+
+(ert-deftest wasabi-send-image-test-clipboard-through-emacs ()
+  ;; Where Emacs can read images from the clipboard itself.
+  (let ((system-type 'gnu/linux)
+        (png-data (base64-decode-string wasabi-send-image-test--png)))
+    (cl-letf (((symbol-function 'gui-get-selection)
+               (lambda (selection type)
+                 (and (eq selection 'CLIPBOARD) (eq type 'image/png) png-data))))
+      (let ((found (wasabi-chat--clipboard-image)))
+        (unwind-protect
+            (progn
+              (should (wasabi-chat--png-file-p (car found)))
+              ;; Made to be sent, so it goes afterwards.
+              (should (cdr found)))
+          (when found (delete-file (car found))))))))
+
+(ert-deftest wasabi-send-image-test-clipboard-through-a-tool ()
+  ;; Where Emacs cannot, a tool writing the PNG to stdout.
+  (let ((system-type 'gnu/linux)
+        (png-data (base64-decode-string wasabi-send-image-test--png)))
+    (cl-letf (((symbol-function 'gui-get-selection) (lambda (&rest _) nil))
+              ((symbol-function 'executable-find)
+               (lambda (name) (equal name "wl-paste")))
+              ((symbol-function 'call-process)
+               (lambda (program _infile destination _display &rest _args)
+                 (should (equal program "wl-paste"))
+                 (let ((coding-system-for-write 'binary))
+                   (with-temp-file (cadr destination)
+                     (set-buffer-multibyte nil)
+                     (insert png-data)))
+                 0)))
+      (let ((found (wasabi-chat--clipboard-image)))
+        (unwind-protect
+            (should (wasabi-chat--png-file-p (car found)))
+          (when found (delete-file (car found))))))))
+
+(ert-deftest wasabi-send-image-test-no-clipboard-image-leaves-nothing ()
+  (let* ((system-type 'gnu/linux)
+         (made nil))
+    (cl-letf* ((real-make-temp-file (symbol-function 'make-temp-file))
+               ((symbol-function 'make-temp-file)
+                (lambda (&rest args) (setq made (apply real-make-temp-file args))))
+               ((symbol-function 'gui-get-selection) (lambda (&rest _) nil))
+               ((symbol-function 'executable-find) (lambda (_) nil)))
+      (should-not (wasabi-chat--clipboard-image))
+      ;; The file it would have saved to is gone again.
+      (should made)
+      (should-not (file-exists-p made)))))
+
+(ert-deftest wasabi-send-image-test-clipboard-on-windows ()
+  (let ((system-type 'windows-nt)
+        (png-data (base64-decode-string wasabi-send-image-test--png))
+        (answer nil)
+        (script nil))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "powershell"))
+              ((symbol-function 'call-process)
+               (lambda (_program _infile _destination _display &rest args)
+                 (setq script (decode-coding-string
+                               (base64-decode-string (car (last args))) 'utf-16le))
+                 (pcase answer
+                   ('picture
+                    (let ((out (progn (string-match "\\$out = '\\(.*\\)'" script)
+                                      (match-string 1 script))))
+                      (let ((coding-system-for-write 'binary))
+                        (with-temp-file (string-replace "''" "'" out)
+                          (set-buffer-multibyte nil)
+                          (insert png-data)))
+                      (insert "IMAGE " out "\n")
+                      0))
+                   ('file (insert "FILE C:/Users/Anil/Pictures/cat.jpg\n") 0)
+                   (_ 1))))
+              ((symbol-function 'file-readable-p)
+               (lambda (file)
+                 (or (equal file "C:/Users/Anil/Pictures/cat.jpg")
+                     (file-exists-p file)))))
+      ;; A copied picture: saved, and made to be sent.
+      (setq answer 'picture)
+      (let ((found (wasabi-chat--clipboard-image)))
+        (unwind-protect
+            (progn (should (wasabi-chat--png-file-p (car found)))
+                   (should (cdr found)))
+          (when found (delete-file (car found)))))
+      ;; The script arrives whole, encoded, and asks the clipboard.
+      (should (string-match-p "Clipboard\\]::GetImage()" script))
+      ;; A file copied in Explorer: sent as it is, and never deleted.
+      (setq answer 'file)
+      (should (equal (wasabi-chat--clipboard-image)
+                     '("C:/Users/Anil/Pictures/cat.jpg")))
+      ;; Neither.
+      (setq answer nil)
+      (should-not (wasabi-chat--clipboard-image)))))
+
+(ert-deftest wasabi-send-image-test-attach-prefers-the-clipboard ()
+  (let* ((file (wasabi-send-image-test--write "clip.png"))
+         (sent nil))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi-chat--clipboard-image)
+                 (lambda () (cons file t)))
+                ((symbol-function 'wasabi-chat--read-caption-for)
+                 (lambda (_file) "look"))
+                ((symbol-function 'wasabi-chat-send-image)
+                 (lambda (&rest args) (setq sent args))))
+        (wasabi-chat-attach)
+        (should (equal sent (list file "look" t)))))))
+
+(ert-deftest wasabi-send-image-test-attach-falls-back-to-picking ()
+  (let ((picked 0))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi-chat--clipboard-image) (lambda () nil))
+                ((symbol-function 'call-interactively)
+                 (lambda (command &rest _)
+                   (should (eq command #'wasabi-chat-send-image))
+                   (setq picked (1+ picked)))))
+        ;; Nothing on the clipboard.
+        (wasabi-chat-attach)
+        (should (equal picked 1))))))
+
+(ert-deftest wasabi-send-image-test-prefix-always-picks ()
+  (let ((looked nil) (picked nil))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi-chat--clipboard-image)
+                 (lambda () (setq looked t) (cons "x.png" t)))
+                ((symbol-function 'call-interactively)
+                 (lambda (&rest _) (setq picked t))))
+        (wasabi-chat-attach '(4))
+        (should picked)
+        ;; Not even a look at the clipboard.
+        (should-not looked)))))
+
+(ert-deftest wasabi-send-image-test-cancelled-clipboard-image-is-cleaned-up ()
+  (let ((file (wasabi-send-image-test--write "clip.png"))
+        (sent nil))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi-chat--clipboard-image)
+                 (lambda () (cons file t)))
+                ((symbol-function 'wasabi-chat--read-caption-for)
+                 (lambda (_file) (signal 'quit nil)))
+                ((symbol-function 'wasabi-chat-send-image)
+                 (lambda (&rest _) (setq sent t))))
+        (wasabi-chat-attach)
+        (should-not sent)
+        (should-not (file-exists-p file))))))
+
+(ert-deftest wasabi-send-image-test-cancelled-copied-file-is-kept ()
+  ;; A file copied in Explorer is the user's own: never deleted.
+  (let ((file (wasabi-send-image-test--write "mine.png")))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi-chat--clipboard-image)
+                 (lambda () (cons file nil)))
+                ((symbol-function 'wasabi-chat--read-caption-for)
+                 (lambda (_file) (signal 'quit nil))))
+        (wasabi-chat-attach)
+        (should (file-exists-p file))))))
+
+(ert-deftest wasabi-send-image-test-temporary-file-goes-after-sending ()
+  (let* ((wasabi-data-dir (make-temp-file "wasabi-test" t))
+         (file (wasabi-send-image-test--write "clip.png"))
+         (appended nil))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi--send-chat-send-image-request)
+                 (lambda (&rest args)
+                   (funcall (plist-get args :on-success)
+                            '((Timestamp . 1790000000) (Id . "3EBCLIP")))))
+                ((symbol-function 'wasabi-chat--append-message)
+                 (lambda (message) (setq appended message))))
+        (wasabi-chat-send-image file nil t)
+        (should-not (file-exists-p file))
+        ;; The kept copy is what the chat shows, and it stays.
+        (should (wasabi-chat--sent-image-file "3EBCLIP"))
+        (should (eq (car (get-text-property 0 'display (map-elt appended :content)))
+                    'image))))))
+
+(ert-deftest wasabi-send-image-test-temporary-file-goes-after-failing ()
+  (let ((file (wasabi-send-image-test--write "clip.png")))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi--send-chat-send-image-request)
+                 (lambda (&rest args)
+                   (funcall (plist-get args :on-failure) '((message . "no"))))))
+        (wasabi-chat-send-image file nil t)
+        (should-not (file-exists-p file))))))
 
 (provide 'wasabi-send-image-test)
 ;;; wasabi-send-image-test.el ends here
