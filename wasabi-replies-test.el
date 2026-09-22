@@ -309,5 +309,20 @@
   (should (eq (lookup-key wasabi-chat-mode-map (kbd "C-c C-r")) #'wasabi-chat-reply))
   (should (eq (lookup-key wasabi-chat-mode-map (kbd "C-c C-k")) #'wasabi-chat-cancel-reply)))
 
+(ert-deftest wasabi-replies-test-header-offers-reply ()
+  (wasabi-replies-test--isolated
+    (wasabi-replies-test--in-chat
+        (list (wasabi-replies-test--row "ORIG1" "lunch?"))
+      ;; On the messages, r.
+      (goto-char (point-min))
+      (search-forward "lunch?")
+      (wasabi-chat--update-header-line)
+      (should (string-match-p "r reply" (substring-no-properties header-line-format)))
+      ;; In the input area r types, so the chord instead.
+      (goto-char (point-max))
+      (wasabi-chat--update-header-line)
+      (should (string-match-p "C-c C-r reply"
+                              (substring-no-properties header-line-format))))))
+
 (provide 'wasabi-replies-test)
 ;;; wasabi-replies-test.el ends here
