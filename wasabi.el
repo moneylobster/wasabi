@@ -1070,6 +1070,30 @@ Calls ON-FAILURE with error if sending fails."
                                     (lambda (error)
                                       (message "Failed to send message: %s" (or (map-elt error 'message) "unknown"))))))
 
+(cl-defun wasabi--send-chat-send-image-request (&key phone image caption on-success on-failure)
+  "Send IMAGE, a data URL, to PHONE with an optional CAPTION.
+Calls ON-SUCCESS with the response when the image is sent.
+Calls ON-FAILURE with the error if sending fails."
+  (unless (derived-mode-p 'wasabi-mode 'wasabi-chat-mode)
+    (error "Not in a chats buffer"))
+  (unless phone
+    (error ":phone is required"))
+  (unless image
+    (error ":image is required"))
+  (acp-send-request :client (map-elt (wasabi--state) :client)
+                    :request (wasabi--make-chat-send-image-request
+                              :token wasabi-user-token
+                              :phone phone
+                              :image image
+                              :caption caption)
+                    :on-success (or on-success
+                                    (lambda (_response)
+                                      (message "Image sent")))
+                    :on-failure (or on-failure
+                                    (lambda (error)
+                                      (message "Failed to send image: %s"
+                                               (or (map-elt error 'message) "unknown"))))))
+
 (cl-defun wasabi--send-download-image-request (&key url direct-path media-key mimetype
                                                     file-enc-sha256 file-sha256 file-length
                                                     on-success on-failure)
@@ -2548,6 +2572,35 @@ Optional parameters:
     (when quoted-text
       (push `(QuotedText . ,quoted-text) params))
     `((:method . "chat.send.text")
+      (:params . ,params))))
+
+(cl-defun wasabi--make-chat-send-image-request (&key token phone image caption)
+  "Instantiate a \"chat.send.image\" request.
+
+  Required parameters:
+    TOKEN - User authentication token
+    PHONE - Phone number with country code or group JID
+    IMAGE - The image as a data URL, \"data:image/png;base64,...\"
+
+  Optional parameters:
+    CAPTION - Text shown beneath the image
+
+  wuzapi uploads the image to WhatsApp and builds its thumbnail
+  itself, which means decoding it: only JPEG, PNG and GIF will do.
+
+  See: stdio.go (chat.send.image), handlers.go (SendImage)"
+  (unless token
+    (error ":token is required"))
+  (unless phone
+    (error ":phone is required"))
+  (unless image
+    (error ":image is required"))
+  (let ((params `((token . ,token)
+                  (Phone . ,phone)
+                  (Image . ,image))))
+    (when (and caption (not (string-empty-p caption)))
+      (setq params (append params `((Caption . ,caption)))))
+    `((:method . "chat.send.image")
       (:params . ,params))))
 
 (cl-defun wasabi--make-download-image-request (&key token

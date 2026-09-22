@@ -42,6 +42,7 @@
 (declare-function wasabi--log "wasabi")
 (declare-function wasabi--send-chat-history-request "wasabi")
 (declare-function wasabi--send-chat-send-text-request "wasabi")
+(declare-function wasabi--send-chat-send-image-request "wasabi")
 (declare-function wasabi--send-download-image-request "wasabi")
 (declare-function wasabi--send-download-video-request "wasabi")
 (declare-function wasabi--canonical-jid "wasabi")
@@ -99,6 +100,7 @@ open it at full size."
   "p" #'wasabi-chat-previous-message
   "g" #'wasabi-chat-refresh
   "RET" #'wasabi-chat-send-input
+  "C-c C-a" #'wasabi-chat-send-image
   "C-a" #'wasabi-chat-beginning-of-line
   "TAB" #'wasabi-chat-next-actionable
   "S-TAB" #'wasabi-chat-previous-actionable
@@ -560,6 +562,115 @@ Shows different bindings depending on whether point is in input area."
                            ;; Recenter to bottom (based on `recenter-top-bottom')
                            (recenter (- -1 (min (max 0 scroll-margin)
 		                                (truncate (/ (window-body-height) 4.0)))) t)))))))))
+
+(defconst wasabi-chat--sendable-image-types
+  '(("jpg" . "image/jpeg")
+    ("jpeg" . "image/jpeg")
+    ("png" . "image/png")
+    ("gif" . "image/gif"))
+  "Image extensions that can be sent, and their MIME types.
+
+wuzapi decodes an image to build its thumbnail, and has decoders for
+these alone: anything else, WebP and HEIC included, fails on its side.")
+
+(defconst wasabi-chat--max-image-bytes (* 16 1024 1024)
+  "The largest image WhatsApp will take.")
+
+(defun wasabi-chat--sendable-image-p (file)
+  "Return non-nil when FILE is an image wuzapi can send, or a directory.
+Directories pass so that `read-file-name' can still browse."
+  (or (file-directory-p file)
+      (and (assoc (downcase (or (file-name-extension file) ""))
+                  wasabi-chat--sendable-image-types)
+           t)))
+
+(defun wasabi-chat--image-data-url (file)
+  "Return FILE as a base64 data URL, checking it can be sent first."
+  (let ((mimetype (cdr (assoc (downcase (or (file-name-extension file) ""))
+                              wasabi-chat--sendable-image-types))))
+    (unless (file-readable-p file)
+      (user-error "Can't read %s" file))
+    (unless mimetype
+      (user-error "Can't send %s: only JPEG, PNG and GIF images can be sent"
+                  (file-name-nondirectory file)))
+    (when (> (file-attribute-size (file-attributes file))
+             wasabi-chat--max-image-bytes)
+      (user-error "%s is too large to send: WhatsApp takes images up to 16 MB"
+                  (file-name-nondirectory file)))
+    (concat "data:" mimetype ";base64,"
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (insert-file-contents-literally file)
+              (base64-encode-region (point-min) (point-max) t)
+              (buffer-string)))))
+
+(defun wasabi-chat--sent-image-content (file caption)
+  "Return how the image FILE, sent with CAPTION, shows in the chat.
+A thumbnail of the file itself, like one received would show."
+  (let* ((extension (downcase (or (file-name-extension file) "")))
+         (image-type (if (member extension '("jpg" "jpeg"))
+                         'jpeg
+                       (intern extension)))
+         (preview (condition-case nil
+                      (wasabi-chat--create-rounded-image
+                       :image-data (with-temp-buffer
+                                     (set-buffer-multibyte nil)
+                                     (insert-file-contents-literally file)
+                                     (buffer-string))
+                       :image-type image-type
+                       :max-width 50
+                       :max-height 50
+                       :corner-radius 6
+                       :padding-top 5
+                       :padding-bottom 5)
+                    (error nil))))
+    (concat (if preview
+                (propertize "[image]" 'display preview)
+              "[image]")
+            (when (and caption (not (string-empty-p caption)))
+              (concat "\n" caption)))))
+
+(defun wasabi-chat-send-image (file &optional caption)
+  "Send the image FILE to this chat, with an optional CAPTION.
+
+Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB."
+  (interactive
+   (progn
+     (unless (derived-mode-p 'wasabi-chat-mode)
+       (user-error "Open a chat to send an image to"))
+     (list (read-file-name "Send image: " nil nil t nil
+                           #'wasabi-chat--sendable-image-p)
+           (read-string "Caption (optional): "))))
+  (unless (derived-mode-p 'wasabi-chat-mode)
+    (user-error "Open a chat to send an image to"))
+  (unless (map-elt wasabi-chat--chat :chat-jid)
+    (error "No chat JID available"))
+  (let ((file (expand-file-name file))
+        (chat-jid (map-elt wasabi-chat--chat :chat-jid))
+        (chat-buffer (current-buffer)))
+    (when (file-directory-p file)
+      (user-error "Pick an image, not a directory"))
+    (let ((image (wasabi-chat--image-data-url file)))
+      (message "Sending %s..." (file-name-nondirectory file))
+      (with-current-buffer (wasabi--buffer)
+        (wasabi--send-chat-send-image-request
+         :phone chat-jid
+         :image image
+         :caption caption
+         :on-failure (lambda (error)
+                       (message "Failed to send image: %s"
+                                (or (map-elt error 'message) "unknown error")))
+         :on-success
+         (lambda (response)
+           (message "Sent %s" (file-name-nondirectory file))
+           (when (buffer-live-p chat-buffer)
+             (with-current-buffer chat-buffer
+               (wasabi-chat--append-message
+                `((:sender-name . "Me")
+                  (:timestamp . ,(format-time-string "%Y-%m-%dT%H:%M:%S%z"
+                                                     (or (map-elt response 'Timestamp)
+                                                         (current-time))))
+                  (:content . ,(wasabi-chat--sent-image-content file caption))))))))))))
 
 (defun wasabi-chat-refresh ()
   "Refresh the current chat buffer by fetching new messages."
