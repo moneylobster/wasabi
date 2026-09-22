@@ -654,7 +654,8 @@ Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB."
       (message "Sending %s..." (file-name-nondirectory file))
       (with-current-buffer (wasabi--buffer)
         (wasabi--send-chat-send-image-request
-         :phone chat-jid
+         ;; As for text: the phone number addressing, when it is known.
+         :phone (wasabi--canonical-jid chat-jid)
          :image image
          :caption caption
          :on-failure (lambda (error)
