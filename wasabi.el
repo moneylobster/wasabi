@@ -95,6 +95,18 @@ Example:
                  (function :tag "Custom function"))
   :group 'wasabi)
 
+(defcustom wasabi-send-read-receipts t
+  "Non-nil to tell senders when you have read their messages.
+
+When on, opening a chat or sending to it marks what they sent you as
+read, and they see blue ticks, as they would from the phone.  When off,
+nothing is sent and your messages still go through.
+
+Toggle it for the session with `wasabi-toggle-read-receipts', bound to
+\\<wasabi-mode-map>\\[wasabi-toggle-read-receipts] in the chat list."
+  :type 'boolean
+  :group 'wasabi)
+
 (defun wasabi-data-dir ()
   "Return the data directory, ensuring it exists.
 Creates the directory if it doesn't exist.
@@ -516,6 +528,26 @@ Calls ON-FAILURE with error if sending fails."
                     :on-failure (or on-failure
                                     (lambda (error)
                                       (message "Failed to send message: %s" (or (map-elt error 'message) "unknown"))))))
+
+(cl-defun wasabi--send-chat-markread-request (&key chat sender ids on-success on-failure)
+  "Mark the messages IDS in CHAT as read.
+SENDER is who sent them, and is needed in a group, where one request
+can only cover one sender's messages.
+Calls ON-SUCCESS with the response, or ON-FAILURE with the error."
+  (unless (derived-mode-p 'wasabi-mode 'wasabi-chat-mode)
+    (error "Not in a chats buffer"))
+  (acp-send-request :client (map-elt (wasabi--state) :client)
+                    :request (wasabi--make-chat-markread-request
+                              :token wasabi-user-token
+                              :chat chat
+                              :sender sender
+                              :ids ids)
+                    :on-success (or on-success #'ignore)
+                    :on-failure (or on-failure
+                                    (lambda (error)
+                                      (wasabi--log "Couldn't send read receipts: %s"
+                                                   (or (map-elt error 'message)
+                                                       "unknown"))))))
 
 (cl-defun wasabi--send-download-image-request (&key url direct-path media-key mimetype
                                                     file-enc-sha256 file-sha256 file-length
@@ -995,6 +1027,7 @@ FACE when non-nil applies the specified face to the text."
     (define-key map (kbd "+") #'wasabi-new-chat-new-number)
     (define-key map (kbd "q") #'wasabi-quit)
     (define-key map (kbd "g") #'wasabi-reload)
+    (define-key map (kbd "r") #'wasabi-toggle-read-receipts)
     map)
   "Keymap for `wasabi-mode'.")
 
@@ -1002,6 +1035,10 @@ FACE when non-nil applies the specified face to the text."
   "Update the header line for the main chats app buffer."
   (let ((bindings `((:command wasabi-new-chat :description "new chat")
                     (:command wasabi-new-chat-new-number :description "new number")
+                    (:command wasabi-toggle-read-receipts
+                              :description ,(if wasabi-send-read-receipts
+                                                "receipts off"
+                                              "receipts on"))
                     (:command wasabi-reload :description "reload")
                     (:command wasabi-quit :description "quit"))))
     (setq header-line-format
@@ -1166,6 +1203,23 @@ With prefix argument NEW-NUMBER, prompt for a phone number."
                                    (when (map-elt selected-entry :is-group)
                                      " (group)")))
           (user-error "No contact or group found"))))))
+
+(defun wasabi-toggle-read-receipts ()
+  "Stop telling senders you have read their messages, or start again.
+
+Lasts for this session.  Customize `wasabi-send-read-receipts' to
+change what wasabi starts with."
+  (interactive)
+  (setq wasabi-send-read-receipts (not wasabi-send-read-receipts))
+  ;; The chat list header offers the opposite, so keep it truthful.
+  (when-let ((buffer (get-buffer "*Wasabi*")))
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'wasabi-mode)
+                 wasabi--state
+                 (eq (map-nested-elt wasabi--state '(:status :type)) 'ready))
+        (wasabi--update-header-line))))
+  (message "Wasabi read receipts %s"
+           (if wasabi-send-read-receipts "on" "off")))
 
 (defun wasabi-open-data-directory ()
   "Open data directory (database, media, etc)."
@@ -1644,6 +1698,35 @@ Optional parameters:
     (when quoted-text
       (push `(QuotedText . ,quoted-text) params))
     `((:method . "chat.send.text")
+      (:params . ,params))))
+
+(cl-defun wasabi--make-chat-markread-request (&key token chat sender ids)
+  "Instantiate a \"chat.markread\" request.
+
+  Required parameters:
+    TOKEN - User authentication token
+    CHAT - JID of the chat the messages are in
+    IDS - List of message IDs to mark as read
+
+  Optional parameters:
+    SENDER - JID of who sent them.  Required in a group: whatsmeow
+             can only mark one sender's messages per request there.
+
+  Sends read receipts, so the sender sees the messages as read.
+
+  See: stdio.go (chat.markread), handlers.go (MarkRead)"
+  (unless token
+    (error ":token is required"))
+  (unless chat
+    (error ":chat is required"))
+  (unless ids
+    (error ":ids is required"))
+  (let ((params `((token . ,token)
+                  (Id . ,(vconcat ids))
+                  (ChatPhone . ,chat))))
+    (when sender
+      (setq params (append params `((SenderPhone . ,sender)))))
+    `((:method . "chat.markread")
       (:params . ,params))))
 
 (cl-defun wasabi--make-download-image-request (&key token
