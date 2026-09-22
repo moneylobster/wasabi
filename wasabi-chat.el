@@ -766,11 +766,15 @@ Shows different bindings depending on whether point is in input area."
                     (wasabi-chat--get-binding-string #'wasabi-chat-next-actionable)
                     " media "
                     (wasabi-chat--get-binding-string #'wasabi-chat-send-input)
-                    " to send message")
+                    " to send message "
+                    (wasabi-chat--get-binding-string #'wasabi-chat-reply)
+                    " reply")
                  ;; No actionables
                  (concat
                   (wasabi-chat--get-binding-string #'wasabi-chat-send-input)
-                  " to send message"))
+                  " to send message "
+                  (wasabi-chat--get-binding-string #'wasabi-chat-reply)
+                  " reply"))
              ;; Outside input area
              (concat
               (when has-actionables
@@ -783,6 +787,8 @@ Shows different bindings depending on whether point is in input area."
               "/"
               (wasabi-chat--get-binding-string #'wasabi-chat-previous-message)
               " message "
+              (wasabi-chat--get-binding-string #'wasabi-chat-reply-or-insert)
+              " reply "
               (wasabi-chat--get-binding-string #'wasabi-chat-refresh)
               " refresh"))))))
 
