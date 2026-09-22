@@ -128,5 +128,91 @@
   (should (eq (lookup-key wasabi-chat-mode-map (kbd "C-c C-a"))
               #'wasabi-chat-send-image)))
 
+(ert-deftest wasabi-send-image-test-keeps-a-copy ()
+  (let* ((wasabi-data-dir (make-temp-file "wasabi-test" t))
+         (file (wasabi-send-image-test--write "Holiday Photo.PNG"))
+         (copy (wasabi-chat--keep-sent-image file "3EB0ABC/123+")))
+    (should (file-exists-p copy))
+    ;; Named by message ID, keeping the original's kind of image.
+    (should (equal (file-name-nondirectory copy) "sent-3EB0ABC123.png"))
+    (should (equal (wasabi-chat--sent-image-file "3EB0ABC/123+") copy))
+    ;; Nothing to name it by, nothing kept.
+    (should-not (wasabi-chat--keep-sent-image file nil))
+    (should-not (wasabi-chat--sent-image-file "never-sent"))))
+
+(ert-deftest wasabi-send-image-test-sent-image-is-drawn ()
+  (let ((content (wasabi-chat--sent-image-content
+                  (wasabi-send-image-test--write "photo.png") nil)))
+    ;; The file itself, not just the word.
+    (should (eq (car (get-text-property 0 'display content)) 'image))
+    ;; And RET opens it.
+    (should (get-text-property 0 'keymap content))))
+
+(ert-deftest wasabi-send-image-test-no-copy-still-says-image ()
+  (let ((content (wasabi-chat--sent-image-content nil "look")))
+    (should (equal (substring-no-properties content) "[image]\nlook"))
+    (should-not (get-text-property 0 'display content))))
+
+(ert-deftest wasabi-send-image-test-reloaded-from-history ()
+  ;; What wuzapi stores for an image sent from here: the caption, if
+  ;; any, and no data_json at all.
+  (let* ((wasabi-data-dir (make-temp-file "wasabi-test" t))
+         (row '((message_id . "SENT1")
+                (message_type . "image")
+                (sender_jid . "me")
+                (text_content . "")
+                (timestamp . "2026-09-22T12:00:00Z")
+                (data_json . ""))))
+    ;; Without our copy it still says what it was, not a blank line.
+    (should (equal (substring-no-properties
+                    (map-elt (wasabi-chat--parse-message row :chat-jid "1@s.whatsapp.net")
+                             :content))
+                   "[image]"))
+    ;; With it, the image comes back.
+    (wasabi-chat--keep-sent-image (wasabi-send-image-test--write "photo.png") "SENT1")
+    (let ((content (map-elt (wasabi-chat--parse-message row :chat-jid "1@s.whatsapp.net")
+                            :content)))
+      (should (eq (car (get-text-property 0 'display content)) 'image)))))
+
+(ert-deftest wasabi-send-image-test-other-stored-messages ()
+  ;; Text sent from here reads as itself.
+  (should (equal (wasabi-chat--stored-content
+                  '((message_type . "text") (text_content . "hello")))
+                 "hello"))
+  ;; Something with no text says what it was, rather than nothing.
+  (should (equal (wasabi-chat--stored-content
+                  '((message_type . "video") (text_content . "")))
+                 "[video]"))
+  (should (equal (wasabi-chat--stored-content
+                  '((message_type . "text") (text_content . "")))
+                 "[message]")))
+
+(ert-deftest wasabi-send-image-test-send-keeps-the-copy ()
+  (let* ((wasabi-data-dir (make-temp-file "wasabi-test" t))
+         (wasabi-buffer (get-buffer-create "*Wasabi*"))
+         (chat-buffer (generate-new-buffer "*wasabi-send-image-test*"))
+         (file (wasabi-send-image-test--write "photo.png"))
+         (appended nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'wasabi--send-chat-send-image-request)
+                   (lambda (&rest args)
+                     ;; What wuzapi answers with.
+                     (funcall (plist-get args :on-success)
+                              '((Details . "Sent") (Timestamp . 1790000000)
+                                (Id . "3EB0SENT")))))
+                  ((symbol-function 'wasabi-chat--append-message)
+                   (lambda (message) (setq appended message))))
+          (with-current-buffer chat-buffer
+            (wasabi-chat-mode)
+            (setq wasabi-chat--chat
+                  (wasabi-chat--make-chat :chat-jid "1@s.whatsapp.net"))
+            (wasabi-chat-send-image file nil))
+          ;; Kept under the ID wuzapi gave it, for the next reload.
+          (should (wasabi-chat--sent-image-file "3EB0SENT"))
+          (should (eq (car (get-text-property 0 'display (map-elt appended :content)))
+                      'image)))
+      (kill-buffer chat-buffer)
+      (kill-buffer wasabi-buffer))))
+
 (provide 'wasabi-send-image-test)
 ;;; wasabi-send-image-test.el ends here

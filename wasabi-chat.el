@@ -289,7 +289,7 @@ REACTIONS is a hash table of message-id -> list of reactions."
       ;; Fallback: parse from basic fields (outgoing messages without data_json)
       (let* ((is-from-me (string= (map-elt p-message 'sender_jid) "me"))
              (sender-name (if is-from-me "Me" (or contact-name chat-jid)))
-             (content (or (map-elt p-message 'text_content) "[message]"))
+             (content (wasabi-chat--stored-content p-message))
              (reactions (when (and msg-id reactions)
                           (map-elt reactions msg-id))))
         (if reactions
@@ -694,31 +694,82 @@ Directories pass so that `read-file-name' can still browse."
               (base64-encode-region (point-min) (point-max) t)
               (buffer-string)))))
 
+(defun wasabi-chat--sent-image-copy-name (message-id)
+  "Return the file name our copy of the image sent as MESSAGE-ID has.
+Without its extension, which is the original's."
+  (when (and (stringp message-id) (not (string-empty-p message-id)))
+    (expand-file-name (concat "sent-"
+                              (replace-regexp-in-string "[^a-zA-Z0-9]" ""
+                                                        message-id))
+                      (expand-file-name "media" (wasabi-data-dir)))))
+
+(defun wasabi-chat--keep-sent-image (file message-id)
+  "Keep a copy of the image FILE, sent as MESSAGE-ID.  Return its path.
+
+wuzapi records a sent image as a caption and nothing else, and WhatsApp
+does not echo our own messages back, so this copy is the only way to
+show it again when the chat is reloaded."
+  (when-let ((name (wasabi-chat--sent-image-copy-name message-id)))
+    (ignore-errors
+      (let ((copy (concat name "." (downcase (or (file-name-extension file)
+                                                 "jpg")))))
+        (make-directory (file-name-directory copy) t)
+        (copy-file file copy t)
+        copy))))
+
+(defun wasabi-chat--sent-image-file (message-id)
+  "Return our copy of the image sent as MESSAGE-ID, or nil."
+  (when-let ((name (wasabi-chat--sent-image-copy-name message-id)))
+    (car (file-expand-wildcards (concat name ".*")))))
+
 (defun wasabi-chat--sent-image-content (file caption)
   "Return how the image FILE, sent with CAPTION, shows in the chat.
-A thumbnail of the file itself, like one received would show."
-  (let* ((extension (downcase (or (file-name-extension file) "")))
-         (image-type (if (member extension '("jpg" "jpeg"))
-                         'jpeg
-                       (intern extension)))
-         (preview (condition-case nil
-                      (wasabi-chat--create-rounded-image
-                       :image-data (with-temp-buffer
-                                     (set-buffer-multibyte nil)
-                                     (insert-file-contents-literally file)
-                                     (buffer-string))
-                       :image-type image-type
-                       :max-width 50
-                       :max-height 50
-                       :corner-radius 6
-                       :padding-top 5
-                       :padding-bottom 5)
-                    (error nil))))
-    (concat (if preview
-                (propertize "[image]" 'display preview)
-              "[image]")
-            (when (and caption (not (string-empty-p caption)))
+
+Drawn from FILE directly, scaled down like a received thumbnail, and
+opened in full with RET.  Embedding a whole photo in the SVG that rounds
+received thumbnails' corners could fail on a large one and leave
+nothing but the word.  FILE may be nil, when there is no copy to draw."
+  (let* ((drawable (and file (file-readable-p file)))
+         (preview (when drawable
+                    (condition-case nil
+                        (create-image file nil nil
+                                      :max-width 50
+                                      :max-height 50
+                                      :ascent 'center)
+                      (error nil))))
+         (image-text (if preview
+                         (propertize "[image]" 'display preview)
+                       (copy-sequence "[image]"))))
+    (when drawable
+      (setq image-text
+            (wasabi--add-action-to-text
+             image-text
+             (lambda ()
+               (interactive)
+               (wasabi-chat--display-cached-image file nil nil)))))
+    (concat image-text
+            (when (and (stringp caption) (not (string-empty-p caption)))
               (concat "\n" caption)))))
+
+(defun wasabi-chat--stored-content (p-message)
+  "Return the content of stored P-MESSAGE, one with no data_json.
+
+Those are the messages sent from here, of which wuzapi keeps only the
+text: a caption at most, for an image.  So an image is drawn from the
+copy kept when it was sent, and anything else with no text at all says
+what it was rather than showing as a blank line."
+  (let ((text (map-elt p-message 'text_content))
+        (type (map-elt p-message 'message_type)))
+    (cond
+     ((equal type "image")
+      (wasabi-chat--sent-image-content
+       (wasabi-chat--sent-image-file (map-elt p-message 'message_id))
+       text))
+     ((and (stringp text) (not (string-empty-p text)))
+      text)
+     ((and (stringp type) (not (member type '("" "text"))))
+      (format "[%s]" type))
+     (t "[message]"))))
 
 (defun wasabi-chat-send-image (file &optional caption)
   "Send the image FILE to this chat, with an optional CAPTION.
@@ -761,7 +812,11 @@ Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB."
                   (:timestamp . ,(format-time-string "%Y-%m-%dT%H:%M:%S%z"
                                                      (or (map-elt response 'Timestamp)
                                                          (current-time))))
-                  (:content . ,(wasabi-chat--sent-image-content file caption))))
+                  (:content . ,(wasabi-chat--sent-image-content
+                                  (or (wasabi-chat--keep-sent-image
+                                       file (map-elt response 'Id))
+                                      file)
+                                  caption))))
                ;; An image in reply is as good as a message for having
                ;; read what they sent.
                (wasabi-chat--send-read-receipts)))))))))
