@@ -149,6 +149,15 @@ it is required internally by the process.")
 
 (defvar-local wasabi--state nil)
 
+(defvar wasabi--own-jid nil
+  "Our own JID, as the session status reports it.
+Needed to reply to our own messages, which quote us as their sender.")
+
+(defun wasabi--remember-own-jid (jid)
+  "Remember JID as our own, without its device suffix."
+  (when (and (stringp jid) (string-match "@" jid))
+    (setq wasabi--own-jid (replace-regexp-in-string ":[0-9]+@" "@" jid))))
+
 (cl-defun wasabi--initialize (&key wasabi-buffer status-type status-message)
   "Initialize wasabi client and progress through startup sequence.
 
@@ -248,6 +257,7 @@ For silent progression, set :silent-refresh in state before calling."
                                      ((and (map-elt response 'connected)
                                            (map-elt response 'loggedIn))
                                       (map-put! (wasabi--state) :connected t)
+                                      (wasabi--remember-own-jid (map-elt response 'jid))
                                       (wasabi--log "Already connected and logged in")
                                       (wasabi--initialize :wasabi-buffer wasabi-buffer
                                                           :status-type 'fetch-contacts
@@ -495,8 +505,11 @@ Invoke ON-FINISHED on success."
                                   (wasabi--log "Failed to fetch chat history for %s: %s" chat-jid (or (map-elt error 'message) "unknown"))
                                   (message "Failed to fetch chat history"))))
 
-(cl-defun wasabi--send-chat-send-text-request (&key phone body on-success on-failure)
+(cl-defun wasabi--send-chat-send-text-request (&key phone body context-info quoted-text
+                                                    on-success on-failure)
   "Send a text message to PHONE with BODY.
+CONTEXT-INFO and QUOTED-TEXT make it a reply: see
+`wasabi--make-chat-send-text-request'.
 Calls ON-SUCCESS when message is sent successfully.
 Calls ON-FAILURE with error if sending fails."
   (unless (derived-mode-p 'wasabi-mode 'wasabi-chat-mode)
@@ -509,7 +522,9 @@ Calls ON-FAILURE with error if sending fails."
                     :request (wasabi--make-chat-send-text-request
                               :token wasabi-user-token
                               :phone phone
-                              :body body)
+                              :body body
+                              :context-info context-info
+                              :quoted-text quoted-text)
                     :on-success (or on-success
                                     (lambda (_response)
                                       (message "Message sent")))
