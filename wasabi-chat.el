@@ -43,6 +43,8 @@
 (declare-function wasabi--send-chat-history-request "wasabi")
 (declare-function wasabi--send-chat-send-text-request "wasabi")
 (declare-function wasabi--send-chat-send-image-request "wasabi")
+(declare-function wasabi--send-chat-markread-request "wasabi")
+(defvar wasabi-send-read-receipts)
 (declare-function wasabi--send-download-image-request "wasabi")
 (declare-function wasabi--send-download-video-request "wasabi")
 (declare-function wasabi--canonical-jid "wasabi")
@@ -332,7 +334,90 @@ For reaction messages, also includes :is-reaction, :target-id and :emoji."
       ;; Regular message
       `((:sender-name . ,sender-name)
         (:timestamp . ,(map-elt p-info 'Timestamp))
-        (:content . ,(wasabi-chat--parse-content p-message))))))
+        (:content . ,(wasabi-chat--parse-content p-message))
+        (:message-id . ,(map-elt p-info 'ID))
+        (:from-me . ,(and is-from-me t))
+        (:sender-jid . ,(wasabi--jid-string sender-jid))
+        (:chat-jid . ,(or (wasabi--jid-string (map-elt p-info 'Chat)) chat-jid))))))
+
+(defun wasabi-chat--receipt-fields (p-message chat-jid)
+  "Return what a read receipt for the stored P-MESSAGE needs to know.
+That is whether we sent it, who did, and the chat it is filed under,
+falling back to CHAT-JID."
+  (let* ((data-json (map-elt p-message 'data_json))
+         (info (when (and (stringp data-json) (not (string-empty-p data-json)))
+                 (ignore-errors
+                   (map-elt (json-parse-string data-json :object-type 'alist
+                                               :null-object nil
+                                               :false-object nil)
+                            'Info)))))
+    (list (cons :from-me (if info
+                             (and (map-elt info 'IsFromMe) t)
+                           (equal (map-elt p-message 'sender_jid) "me")))
+          (cons :sender-jid (or (map-elt info 'Sender)
+                                (map-elt p-message 'sender_jid)))
+          (cons :chat-jid (or (map-elt info 'Chat)
+                              (map-elt p-message 'chat_jid)
+                              chat-jid)))))
+
+(defvar wasabi-chat--read-receipts-sent (make-hash-table :test 'equal)
+  "Message IDs a read receipt has gone out for this session.")
+
+(defconst wasabi-chat--read-receipts-max 50
+  "How many of a chat's latest incoming messages to mark read at once.
+Enough to cover what arrived while away without sending WhatsApp a
+receipt for a chat's entire history the first time it is opened.")
+
+(defun wasabi-chat--pending-receipts (messages)
+  "Group the incoming MESSAGES still owed a read receipt.
+
+Takes the latest `wasabi-chat--read-receipts-max' of them and returns
+a list of (CHAT SENDER . IDS), one per request: in a group each sender
+needs their own, and in a one-to-one chat SENDER is nil."
+  (let* ((pending (seq-filter
+                   (lambda (message)
+                     (and (not (map-elt message :from-me))
+                          (map-elt message :message-id)
+                          (map-elt message :chat-jid)
+                          (not (gethash (map-elt message :message-id)
+                                        wasabi-chat--read-receipts-sent))))
+                   messages))
+         (latest (last pending wasabi-chat--read-receipts-max))
+         (groups '()))
+    (dolist (message latest)
+      (let* ((chat (map-elt message :chat-jid))
+             (sender (when (string-suffix-p "@g.us" chat)
+                       (map-elt message :sender-jid)))
+             (key (cons chat sender))
+             (group (assoc key groups)))
+        (if group
+            (setcdr group (append (cdr group) (list (map-elt message :message-id))))
+          (push (cons key (list (map-elt message :message-id))) groups))))
+    (mapcar (lambda (group)
+              (cons (car (car group)) (cons (cdr (car group)) (cdr group))))
+            (nreverse groups))))
+
+(defun wasabi-chat--send-read-receipts ()
+  "Tell senders this chat's messages have been read, if we are to.
+
+Called on opening a chat and on sending to it.  A receipt that fails to
+go out is tried again next time rather than forgotten."
+  (when (and wasabi-send-read-receipts
+             (derived-mode-p 'wasabi-chat-mode)
+             (get-buffer "*Wasabi*"))
+    (let ((requests (wasabi-chat--pending-receipts
+                     (map-elt wasabi-chat--chat :messages))))
+      (when requests
+        (with-current-buffer (wasabi--buffer)
+          (dolist (request requests)
+            (let ((ids (cddr request)))
+              (wasabi--send-chat-markread-request
+               :chat (car request)
+               :sender (cadr request)
+               :ids ids
+               :on-success (lambda (_response)
+                             (dolist (id ids)
+                               (puthash id t wasabi-chat--read-receipts-sent)))))))))))
 
 (cl-defun wasabi-chat--parse-reactions (p-messages &key contacts)
   "Parse reactions from P-MESSAGES and return a hash map of message-id -> reactions.
@@ -363,11 +448,14 @@ Messages with reactions will have a :reactions field."
   (let* ((reactions (wasabi-chat--parse-reactions p-messages :contacts contacts))
          (parsed (delq nil
                        (mapcar (lambda (p-msg)
-                                 (wasabi-chat--parse-message p-msg
-                                                             :chat-jid chat-jid
-                                                             :contact-name contact-name
-                                                             :contacts contacts
-                                                             :reactions reactions))
+                                 (when-let ((message
+                                             (wasabi-chat--parse-message p-msg
+                                                                         :chat-jid chat-jid
+                                                                         :contact-name contact-name
+                                                                         :contacts contacts
+                                                                         :reactions reactions)))
+                                   (append message
+                                           (wasabi-chat--receipt-fields p-msg chat-jid))))
                                (append p-messages nil)))))
     ;; Parsing learns JID pairings from each message's Info; persist
     ;; whatever this batch turned up, in one go.
@@ -554,7 +642,9 @@ Shows different bindings depending on whether point is in input area."
                                        (:timestamp . ,timestamp-str)
                                        (:content . ,text))))
                        (with-current-buffer chat-buffer
-                         (wasabi-chat--append-message message))
+                         (wasabi-chat--append-message message)
+                         ;; Replying means having read what they sent.
+                         (wasabi-chat--send-read-receipts))
                        (with-current-buffer chat-buffer
                          (goto-char (point-max)))
                        (with-current-buffer chat-buffer
@@ -798,7 +888,8 @@ MESSAGES is a list of already-parsed internal message alists."
     (wasabi-chat--setup-prompt)
     (wasabi-chat--update-header-line)
     (goto-char (point-max)))
-  (wasabi-chat--load-stickers))
+  (wasabi-chat--load-stickers)
+  (wasabi-chat--send-read-receipts))
 
 (cl-defun wasabi-chat--render-message (&key sender-name timestamp content max-sender-width reactions message-id)
   "Render a single internal message.
