@@ -14,10 +14,15 @@
 (require 'ert)
 (require 'wasabi)
 
+;; Declared rather than required: read receipts may or may not be part
+;; of the wasabi under test, and these tests are not about them.
+(defvar wasabi-send-read-receipts)
+
 (defmacro wasabi-replies-test--isolated (&rest body)
   "Run BODY with no remembered JIDs or sent quotes, and a scratch data dir."
   (declare (indent 0))
   `(let ((wasabi-data-dir (make-temp-file "wasabi-test" t))
+         (wasabi-send-read-receipts nil)
          (wasabi-chat--sent-quotes nil)
          (wasabi-chat--own-jids '())
          (wasabi--own-jid nil))
