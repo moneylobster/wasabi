@@ -33,6 +33,7 @@
 (require 'map)
 (require 'parse-time)
 (require 'seq)
+(require 'text-property-search)
 (require 'wasabi-icon)
 
 (declare-function wasabi--add-action-to-text "wasabi")
@@ -98,6 +99,9 @@ open it at full size."
 (defvar-keymap wasabi-chat-mode-map
   :doc "Keymap for `wasabi-chat-mode'."
   "q" #'wasabi-chat-quit
+  "r" #'wasabi-chat-reply-or-insert
+  "C-c C-r" #'wasabi-chat-reply
+  "C-c C-k" #'wasabi-chat-cancel-reply
   "n" #'wasabi-chat-next-message
   "p" #'wasabi-chat-previous-message
   "g" #'wasabi-chat-refresh
@@ -338,7 +342,8 @@ For reaction messages, also includes :is-reaction, :target-id and :emoji."
         (:message-id . ,(map-elt p-info 'ID))
         (:from-me . ,(and is-from-me t))
         (:sender-jid . ,(wasabi--jid-string sender-jid))
-        (:chat-jid . ,(or (wasabi--jid-string (map-elt p-info 'Chat)) chat-jid))))))
+        (:chat-jid . ,(or (wasabi--jid-string (map-elt p-info 'Chat)) chat-jid))
+        (:quote . ,(wasabi-chat--quote p-message))))))
 
 (defun wasabi-chat--receipt-fields (p-message chat-jid)
   "Return what a read receipt for the stored P-MESSAGE needs to know.
@@ -419,6 +424,240 @@ go out is tried again next time rather than forgotten."
                              (dolist (id ids)
                                (puthash id t wasabi-chat--read-receipts-sent)))))))))))
 
+;;; Replies
+
+(defvar wasabi--own-jid)
+(defvar wasabi--state)
+
+(defvar wasabi-chat--own-jids '()
+  "JIDs seen on our own messages, which may differ from `wasabi--own-jid'.
+WhatsApp addresses us by phone number or by linked identity depending
+on the chat, and history is the only place to learn the latter.")
+
+(defun wasabi-chat--strip-device (jid)
+  "Return JID without its device suffix."
+  (when (and (stringp jid) (not (string-empty-p jid)))
+    (replace-regexp-in-string ":[0-9]+@" "@" jid)))
+
+(defun wasabi-chat--jid-user (jid)
+  "Return the user part of JID."
+  (when (and (stringp jid) (string-match "\\`\\([^@:]+\\)" jid))
+    (match-string 1 jid)))
+
+(defun wasabi-chat--own-jid-p (jid)
+  "Return non-nil when JID is one of ours."
+  (when-let ((user (wasabi-chat--jid-user jid)))
+    (seq-some (lambda (own)
+                (or (equal (wasabi-chat--jid-user own) user)
+                    ;; Ours under the other addressing, once paired.
+                    (wasabi--same-chat-p own jid)))
+              (delq nil (cons wasabi--own-jid wasabi-chat--own-jids)))))
+
+(defun wasabi-chat--jid-display-name (jid)
+  "Return a name for JID from the contact list, or its number."
+  (when-let ((jid (wasabi-chat--strip-device jid)))
+    (let* ((buffer (get-buffer "*Wasabi*"))
+           (state (and buffer (buffer-local-value 'wasabi--state buffer))))
+      ;; Across the JID's other addressing, and learned push names.
+      (or (wasabi--contact-display-name jid (map-elt state :contacts))
+          (wasabi-chat--jid-user jid)))))
+
+(defun wasabi-chat--summarize (p-message)
+  "Return a one-line summary of protocol P-MESSAGE, for a quote."
+  (let* ((labelled (lambda (label text)
+                     (if (and (stringp text) (not (string-empty-p text)))
+                         (concat label " " text)
+                       label)))
+         (conversation (map-elt p-message 'conversation))
+         (summary
+          (cond
+           ((and (stringp conversation) (not (string-empty-p conversation)))
+            conversation)
+           ((map-nested-elt p-message '(extendedTextMessage text)))
+           ((map-elt p-message 'imageMessage)
+            (funcall labelled "[image]"
+                     (map-nested-elt p-message '(imageMessage caption))))
+           ((map-elt p-message 'videoMessage)
+            (funcall labelled "[video]"
+                     (map-nested-elt p-message '(videoMessage caption))))
+           ((map-elt p-message 'stickerMessage) "[sticker]")
+           ((map-elt p-message 'audioMessage) "[audio]")
+           ((map-elt p-message 'documentMessage)
+            (funcall labelled "[document]"
+                     (or (map-nested-elt p-message '(documentMessage title))
+                         (map-nested-elt p-message '(documentMessage fileName)))))
+           (t "[message]"))))
+    (truncate-string-to-width (replace-regexp-in-string "[\n\r]+" " " summary)
+                              80 nil nil "…")))
+
+(defun wasabi-chat--quote (p-message)
+  "Return what protocol P-MESSAGE replies to, or nil if it is no reply.
+An alist of :id, the quoted message's ID, :participant, who wrote it,
+and :text, a summary of it."
+  (seq-some (lambda (entry)
+              (let* ((value (cdr entry))
+                     (context (and (consp value) (map-elt value 'contextInfo)))
+                     (id (and (consp context) (map-elt context 'stanzaID))))
+                (when (and (stringp id) (not (string-empty-p id)))
+                  (list (cons :id id)
+                        (cons :participant (map-elt context 'participant))
+                        (cons :text (wasabi-chat--summarize
+                                     (map-elt context 'quotedMessage)))))))
+            (and (consp p-message) p-message)))
+
+;; Replies sent from here lose their quote on the way into wuzapi's
+;; history, which stores only their text, so the quote is kept here.
+
+(defvar wasabi-chat--sent-quotes nil
+  "Hash table of message ID to the quote a reply sent from here carried.")
+
+(defun wasabi-chat--sent-quotes-file ()
+  "Return the file keeping the quotes of replies sent from here."
+  (expand-file-name "sent-quotes.eld" (wasabi-data-dir)))
+
+(defun wasabi-chat--sent-quotes ()
+  "Return the sent quotes table, loading it from disk the first time."
+  (unless wasabi-chat--sent-quotes
+    (setq wasabi-chat--sent-quotes (make-hash-table :test 'equal))
+    (ignore-errors
+      (when (file-exists-p (wasabi-chat--sent-quotes-file))
+        (dolist (entry (with-temp-buffer
+                         (insert-file-contents (wasabi-chat--sent-quotes-file))
+                         (read (current-buffer))))
+          (puthash (car entry) (cdr entry) wasabi-chat--sent-quotes)))))
+  wasabi-chat--sent-quotes)
+
+(defun wasabi-chat--remember-sent-quote (message-id quoted)
+  "Remember that the reply sent as MESSAGE-ID carried the quote QUOTED."
+  (when (and (stringp message-id) (not (string-empty-p message-id)) quoted)
+    (puthash message-id quoted (wasabi-chat--sent-quotes))
+    (ignore-errors
+      (let ((entries '()))
+        (maphash (lambda (id quoted) (push (cons id quoted) entries))
+                 wasabi-chat--sent-quotes)
+        (with-temp-file (wasabi-chat--sent-quotes-file)
+          (let ((print-length nil) (print-level nil))
+            (prin1 entries (current-buffer))))))))
+
+(defun wasabi-chat--reply-fields (p-message)
+  "Return what replying to, or quoting, stored P-MESSAGE needs.
+That is :from-me, :sender-jid and, when it is itself a reply, :quote."
+  (let* ((data-json (map-elt p-message 'data_json))
+         (p-data (when (and (stringp data-json) (not (string-empty-p data-json)))
+                   (ignore-errors
+                     (json-parse-string data-json :object-type 'alist
+                                        :null-object nil :false-object nil))))
+         (info (map-elt p-data 'Info))
+         (from-me (if info
+                      (and (map-elt info 'IsFromMe) t)
+                    (equal (map-elt p-message 'sender_jid) "me")))
+         (sender (wasabi-chat--strip-device (map-elt info 'Sender))))
+    (when (and from-me sender (not (member sender wasabi-chat--own-jids)))
+      (push sender wasabi-chat--own-jids))
+    (list (cons :from-me from-me)
+          (cons :sender-jid (or sender
+                                (unless from-me (map-elt p-message 'sender_jid))))
+          (cons :quote (if p-data
+                           (wasabi-chat--quote (map-elt p-data 'Message))
+                         (gethash (map-elt p-message 'message_id)
+                                  (wasabi-chat--sent-quotes)))))))
+
+(defun wasabi-chat--quote-author (quote-info)
+  "Return who wrote the message the quote QUOTE-INFO refers to."
+  (let ((quoted-message (seq-find (lambda (message)
+                                    (equal (map-elt message :message-id)
+                                           (map-elt quote-info :id)))
+                                  (map-elt wasabi-chat--chat :messages))))
+    (cond
+     (quoted-message
+      (let ((name (map-elt quoted-message :sender-name)))
+        (if (equal name "Me") "You" name)))
+     ((wasabi-chat--own-jid-p (map-elt quote-info :participant)) "You")
+     ((wasabi-chat--jid-display-name (map-elt quote-info :participant)))
+     (t "Someone"))))
+
+(defun wasabi-chat--render-quote (quote-info)
+  "Return the line showing the quote QUOTE-INFO, above the reply that carries it.
+RET on it goes to the quoted message."
+  (let ((id (map-elt quote-info :id)))
+    (wasabi--add-action-to-text
+     (propertize (concat "│ " (wasabi-chat--quote-author quote-info) ": "
+                         (or (map-elt quote-info :text) ""))
+                 'face 'font-lock-comment-face
+                 'wasabi-quoted-id id)
+     (lambda ()
+       (interactive)
+       (wasabi-chat-goto-quoted id)))))
+
+(defun wasabi-chat-goto-quoted (id)
+  "Go to the message with ID, which a reply quotes."
+  (let ((match (save-excursion
+                 (goto-char (point-min))
+                 (text-property-search-forward 'wasabi-message-id id #'equal))))
+    (if (not match)
+        (message "That message is not loaded")
+      (goto-char (prop-match-beginning match))
+      (beginning-of-line)
+      (pulse-momentary-highlight-one-line (point)))))
+
+(defun wasabi-chat--message-at-point ()
+  "Return the message point is on, or the latest one from the prompt."
+  (save-excursion
+    (unless (get-text-property (point) 'wasabi-sender)
+      (text-property-search-backward 'wasabi-sender t t))
+    (when (get-text-property (point) 'wasabi-sender)
+      (let ((id (get-text-property (point) 'wasabi-message-id)))
+        (when id
+          (seq-find (lambda (message) (equal (map-elt message :message-id) id))
+                    (map-elt wasabi-chat--chat :messages)))))))
+
+(defun wasabi-chat--reply-participant (message)
+  "Return the JID of whoever sent MESSAGE, as a reply must name them."
+  (let ((sender (map-elt message :sender-jid)))
+    (if (map-elt message :from-me)
+        (or wasabi--own-jid
+            (car wasabi-chat--own-jids)
+            (and sender (not (equal sender "me")) sender))
+      (wasabi-chat--strip-device sender))))
+
+(defun wasabi-chat--message-summary (message)
+  "Return a one-line summary of internal MESSAGE's content."
+  (truncate-string-to-width
+   (replace-regexp-in-string "[\n\r]+" " "
+                             (substring-no-properties (or (map-elt message :content) "")))
+   80 nil nil "…"))
+
+(defun wasabi-chat-reply ()
+  "Reply to the message at point, or to the latest one from the prompt.
+The next message sent goes out as the reply.  Cancel with
+\\<wasabi-chat-mode-map>\\[wasabi-chat-cancel-reply]."
+  (interactive)
+  (unless (derived-mode-p 'wasabi-chat-mode)
+    (user-error "Not in a chat buffer"))
+  (let ((message (wasabi-chat--message-at-point)))
+    (unless message
+      (user-error "No message here to reply to"))
+    (unless (wasabi-chat--reply-participant message)
+      (user-error "Can't tell who sent that message, so can't reply to it"))
+    (wasabi-chat--update-chat :reply-to message)
+    (goto-char (point-max))
+    (wasabi-chat--update-header-line)
+    (message "Replying to %s" (wasabi-chat--message-summary message))))
+
+(defun wasabi-chat-reply-or-insert ()
+  "Reply to the message at point, or insert the key in the input area."
+  (interactive)
+  (if (wasabi-chat--in-input-area-p)
+      (self-insert-command 1)
+    (wasabi-chat-reply)))
+
+(defun wasabi-chat-cancel-reply ()
+  "Stop replying: the next message goes out as a plain message."
+  (interactive)
+  (wasabi-chat--update-chat :reply-to nil)
+  (wasabi-chat--update-header-line)
+  (message "Not replying"))
+
 (cl-defun wasabi-chat--parse-reactions (p-messages &key contacts)
   "Parse reactions from P-MESSAGES and return a hash map of message-id -> reactions.
 Each reaction is an alist with :emoji and :sender keys.
@@ -455,7 +694,8 @@ Messages with reactions will have a :reactions field."
                                                                          :contacts contacts
                                                                          :reactions reactions)))
                                    (append message
-                                           (wasabi-chat--receipt-fields p-msg chat-jid))))
+                                           (wasabi-chat--receipt-fields p-msg chat-jid)
+                                           (wasabi-chat--reply-fields p-msg))))
                                (append p-messages nil)))))
     ;; Parsing learns JID pairings from each message's Info; persist
     ;; whatever this batch turned up, in one go.
@@ -505,6 +745,18 @@ Shows different bindings depending on whether point is in input area."
              (concat
               " "
               (propertize title 'face 'font-lock-doc-face) " "))
+           (when-let ((reply (map-elt wasabi-chat--chat :reply-to)))
+             (concat (propertize (format "replying to %s: %s"
+                                         (if (map-elt reply :from-me)
+                                             "yourself"
+                                           (map-elt reply :sender-name))
+                                         (truncate-string-to-width
+                                          (wasabi-chat--message-summary reply)
+                                          30 nil nil "…"))
+                                 'face 'warning)
+                     " "
+                     (wasabi-chat--get-binding-string #'wasabi-chat-cancel-reply)
+                     " cancel "))
            (if in-input-area
                ;; In input area
                (if has-actionables
@@ -607,9 +859,14 @@ Shows different bindings depending on whether point is in input area."
     (error "No chat information available"))
   (unless (map-elt wasabi-chat--chat :chat-jid)
     (error "No chat JID available"))
-  (let ((text (string-trim (wasabi-chat--get-prompt-input)))
-        (chat-jid (map-elt wasabi-chat--chat :chat-jid))
-        (chat-buffer (current-buffer)))
+  (let* ((text (string-trim (wasabi-chat--get-prompt-input)))
+         (chat-jid (map-elt wasabi-chat--chat :chat-jid))
+         (chat-buffer (current-buffer))
+         (reply-to (map-elt wasabi-chat--chat :reply-to))
+         (reply-quote (when reply-to
+                  (list (cons :id (map-elt reply-to :message-id))
+                        (cons :participant (wasabi-chat--reply-participant reply-to))
+                        (cons :text (wasabi-chat--message-summary reply-to))))))
     (wasabi-chat--clear-prompt-input)
     (message "Sending...")
     (with-current-buffer (wasabi--buffer)
@@ -618,6 +875,10 @@ Shows different bindings depending on whether point is in input area."
        ;; addressing is known, prefer it over a LID.
        :phone (wasabi--canonical-jid chat-jid)
        :body text
+       :context-info (when reply-quote
+                       `((StanzaID . ,(map-elt reply-quote :id))
+                         (Participant . ,(map-elt reply-quote :participant))))
+       :quoted-text (map-elt reply-quote :text)
        :on-failure (lambda (error)
                      (message "Failed to send")
                      (wasabi--log "Failed to send message: %s"
@@ -640,8 +901,16 @@ Shows different bindings depending on whether point is in input area."
                                    (t (format-time-string "%Y-%m-%dT%H:%M:%S%z"))))
                             (message `((:sender-name . "Me")
                                        (:timestamp . ,timestamp-str)
-                                       (:content . ,text))))
+                                       (:content . ,text)
+                                       (:message-id . ,(map-elt response 'Id))
+                                       (:from-me . t)
+                                       (:quote . ,reply-quote))))
+                       ;; wuzapi keeps only the text of what we send.
+                       (wasabi-chat--remember-sent-quote (map-elt response 'Id) reply-quote)
                        (with-current-buffer chat-buffer
+                         (when reply-quote
+                           (wasabi-chat--update-chat :reply-to nil)
+                           (wasabi-chat--update-header-line))
                          (wasabi-chat--append-message message)
                          ;; Replying means having read what they sent.
                          (wasabi-chat--send-read-receipts))
@@ -816,7 +1085,10 @@ Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB."
                                   (or (wasabi-chat--keep-sent-image
                                        file (map-elt response 'Id))
                                       file)
-                                  caption))))
+                                  caption))
+                  ;; So it can be replied to straight away.
+                  (:message-id . ,(map-elt response 'Id))
+                  (:from-me . t)))
                ;; An image in reply is as good as a message for having
                ;; read what they sent.
                (wasabi-chat--send-read-receipts)))))))))
@@ -949,14 +1221,15 @@ MESSAGES is a list of already-parsed internal message alists."
   (wasabi-chat--load-stickers)
   (wasabi-chat--send-read-receipts))
 
-(cl-defun wasabi-chat--render-message (&key sender-name timestamp content max-sender-width reactions message-id)
+(cl-defun wasabi-chat--render-message (&key sender-name timestamp content max-sender-width reactions message-id ((:quote quoted)))
   "Render a single internal message.
 SENDER-NAME is the display name of the sender.
 TIMESTAMP is the ISO8601 timestamp string.
 CONTENT is the display content (already parsed, may include text properties).
 MAX-SENDER-WIDTH is used for padding alignment.
 REACTIONS is a list of reaction alists with :emoji and :sender keys.
-MESSAGE-ID is used to tag the rendered message for later updates."
+MESSAGE-ID is used to tag the rendered message for later updates.
+QUOTE, when the message is a reply, is the quote of what it replies to."
   (let* ((col1-width max-sender-width)
          (is-from-me (string= sender-name "Me"))
          (sender (propertize sender-name
@@ -986,6 +1259,9 @@ MESSAGE-ID is used to tag the rendered message for later updates."
     ;;
     (concat sender-padding sender " " (or time "")
             "\n" (make-string col1-width ?\s) " "
+            (when quoted
+              (concat (wasabi-chat--render-quote quoted)
+                      "\n" (make-string col1-width ?\s) " "))
             (string-replace "\n" (concat "\n " (make-string col1-width ?\s)) content)
             ;; Add reactions below the message
             (when reactions
@@ -1016,7 +1292,8 @@ MESSAGES is a list of alists with :sender-name, :timestamp, :content."
               :content (map-elt msg :content)
               :max-sender-width max-sender-width
               :reactions (map-elt msg :reactions)
-              :message-id (map-elt msg :message-id)))
+              :message-id (map-elt msg :message-id)
+              :quote (map-elt msg :quote)))
            messages)))
     (let ((start (point)))
       (insert "\n" (mapconcat #'identity message-lines))
@@ -1054,7 +1331,8 @@ Updates :messages list and :max-sender-width in chat state."
                :content (map-elt message :content)
                :max-sender-width (map-elt wasabi-chat--chat :max-sender-width)
                :reactions (map-elt message :reactions)
-               :message-id (map-elt message :message-id)))
+               :message-id (map-elt message :message-id)
+               :quote (map-elt message :quote)))
       (put-text-property start (point) 'read-only t))
     (wasabi-chat--setup-prompt)
     ;; Restore saved input
@@ -1122,7 +1400,8 @@ Finds the message in :messages, updates it, and re-renders just that message."
                          :content (map-elt updated-msg :content)
                          :max-sender-width (map-elt wasabi-chat--chat :max-sender-width)
                          :reactions (map-elt updated-msg :reactions)
-                         :message-id (map-elt updated-msg :message-id)))
+                         :message-id (map-elt updated-msg :message-id)
+                         :quote (map-elt updated-msg :quote)))
                 ;; Ensure newline before prompt.
                 (unless next-sender
                   (insert "\n\n")))))))
