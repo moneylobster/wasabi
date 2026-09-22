@@ -995,6 +995,7 @@ FACE when non-nil applies the specified face to the text."
     (define-key map (kbd "+") #'wasabi-new-chat-new-number)
     (define-key map (kbd "q") #'wasabi-quit)
     (define-key map (kbd "g") #'wasabi-reload)
+    (define-key map (kbd "m") #'wasabi-toggle-notifications)
     map)
   "Keymap for `wasabi-mode'.")
 
@@ -1002,6 +1003,10 @@ FACE when non-nil applies the specified face to the text."
   "Update the header line for the main chats app buffer."
   (let ((bindings `((:command wasabi-new-chat :description "new chat")
                     (:command wasabi-new-chat-new-number :description "new number")
+                    (:command wasabi-toggle-notifications
+                              :description ,(if wasabi-notifications-enabled
+                                                "mute"
+                                              "unmute"))
                     (:command wasabi-reload :description "reload")
                     (:command wasabi-quit :description "quit"))))
     (setq header-line-format
@@ -1166,6 +1171,23 @@ With prefix argument NEW-NUMBER, prompt for a phone number."
                                    (when (map-elt selected-entry :is-group)
                                      " (group)")))
           (user-error "No contact or group found"))))))
+
+(defun wasabi-toggle-notifications ()
+  "Turn notifications for incoming messages off, or back on.
+
+Lasts for this session.  Customize `wasabi-notifications-enabled' to
+change what wasabi starts with."
+  (interactive)
+  (setq wasabi-notifications-enabled (not wasabi-notifications-enabled))
+  ;; The chat list header offers mute or unmute, so keep it truthful.
+  (when-let ((buffer (get-buffer "*Wasabi*")))
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'wasabi-mode)
+                 wasabi--state
+                 (eq (map-nested-elt wasabi--state '(:status :type)) 'ready))
+        (wasabi--update-header-line))))
+  (message "Wasabi notifications %s"
+           (if wasabi-notifications-enabled "on" "off")))
 
 (defun wasabi-open-data-directory ()
   "Open data directory (database, media, etc)."

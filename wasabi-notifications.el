@@ -46,9 +46,20 @@ This can be:
     (function :tag "Custom function"))
   :group 'wasabi)
 
+(defcustom wasabi-notifications-enabled t
+  "Non-nil to show notifications for incoming messages.
+
+Toggle it for the session with `wasabi-toggle-notifications', bound to
+\\<wasabi-mode-map>\\[wasabi-toggle-notifications] in the chat list.  Unlike setting
+`wasabi-message-notification-function' to nil, this leaves your choice
+of how to be notified alone, so turning them back on restores it."
+  :type 'boolean
+  :group 'wasabi)
+
 (defun wasabi--notify (message)
   "Display a notification with MESSAGE if needed."
-  (when wasabi-message-notification-function
+  (when (and wasabi-notifications-enabled
+             wasabi-message-notification-function)
     (cond
      ((eq wasabi-message-notification-function 'notifications)
       (wasabi--notify-with-notifications message))
