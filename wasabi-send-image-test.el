@@ -418,5 +418,28 @@
         (wasabi-chat-send-image file nil t)
         (should-not (file-exists-p file))))))
 
+(ert-deftest wasabi-send-image-test-clipboard-answer-among-noise ()
+  ;; What PowerShell really prints when stderr is not kept apart: a
+  ;; progress record in CLIXML around the answer.
+  (should (equal (wasabi-chat--clipboard-script-answer
+                  "#< CLIXML\nIMAGE c:/Temp/clip.png\n<Objs Version=\"1.1.0.1\"><Obj S=\"progress\"/></Objs>")
+                 '(image . "c:/Temp/clip.png")))
+  (should (equal (wasabi-chat--clipboard-script-answer "FILE C:/Pictures/cat.jpg\r\n")
+                 '(file . "C:/Pictures/cat.jpg")))
+  (should-not (wasabi-chat--clipboard-script-answer "#< CLIXML\n<Objs/>"))
+  (should-not (wasabi-chat--clipboard-script-answer nil)))
+
+(ert-deftest wasabi-send-image-test-powershell-stderr-kept-apart ()
+  (let ((system-type 'windows-nt)
+        (destination nil))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "powershell"))
+              ((symbol-function 'call-process)
+               (lambda (_program _infile dest &rest _)
+                 (setq destination dest)
+                 1)))
+      (wasabi-chat--clipboard-image)
+      ;; Standard output to the buffer, standard error discarded.
+      (should (equal destination '(t nil))))))
+
 (provide 'wasabi-send-image-test)
 ;;; wasabi-send-image-test.el ends here
