@@ -518,8 +518,14 @@ Shows different bindings depending on whether point is in input area."
 wuzapi decodes an image to build its thumbnail, and has decoders for
 these alone: anything else, WebP and HEIC included, fails on its side.")
 
-(defconst wasabi-chat--max-image-bytes (* 16 1024 1024)
-  "The largest image WhatsApp will take.")
+(defconst wasabi-chat--max-image-bytes 370000
+  "The largest image wuzapi can be handed, in bytes.
+
+wuzapi reads each request from wasabi as one line of at most 512 KB,
+and exits altogether when a line is longer.  The image travels in the
+request base64-encoded, a third larger again, so this leaves room for
+that and for the rest of the request.  Larger images are shrunk to fit:
+see `wasabi-chat--fit-image'.")
 
 (defun wasabi-chat--sendable-image-p (file)
   "Return non-nil when FILE is an image wuzapi can send, or a directory.
@@ -540,8 +546,9 @@ Directories pass so that `read-file-name' can still browse."
                   (file-name-nondirectory file)))
     (when (> (file-attribute-size (file-attributes file))
              wasabi-chat--max-image-bytes)
-      (user-error "%s is too large to send: WhatsApp takes images up to 16 MB"
-                  (file-name-nondirectory file)))
+      (user-error "%s is too large to send: wuzapi takes images up to %s"
+                  (file-name-nondirectory file)
+                  (file-size-human-readable wasabi-chat--max-image-bytes)))
     (concat "data:" mimetype ";base64,"
             (with-temp-buffer
               (set-buffer-multibyte nil)
@@ -629,7 +636,8 @@ what it was rather than showing as a blank line."
 (defun wasabi-chat-send-image (file &optional caption delete-after)
   "Send the image FILE to this chat, with an optional CAPTION.
 
-Offers only images that can be sent: JPEG, PNG and GIF, up to 16 MB.
+Offers only images that can be sent: JPEG, PNG and GIF.  One too large
+for wuzapi is shrunk to fit first; see `wasabi-chat--fit-image'.
 DELETE-AFTER, when non-nil, deletes FILE once the send is done with it,
 for a file made only to be sent."
   (interactive
@@ -648,8 +656,14 @@ for a file made only to be sent."
         (chat-buffer (current-buffer)))
     (when (file-directory-p file)
       (user-error "Pick an image, not a directory"))
-    (let ((image (wasabi-chat--image-data-url file)))
-      (message "Sending %s..." (file-name-nondirectory file))
+    (let* ((original file)
+           (fitted (wasabi-chat--fit-image file))
+           (file (car fitted))
+           (cleanup (lambda ()
+                      (when (cdr fitted) (ignore-errors (delete-file file)))
+                      (when delete-after (ignore-errors (delete-file original)))))
+           (image (wasabi-chat--image-data-url file)))
+      (message "Sending %s..." (file-name-nondirectory original))
       (with-current-buffer (wasabi--buffer)
         (wasabi--send-chat-send-image-request
          :phone chat-jid
@@ -658,11 +672,10 @@ for a file made only to be sent."
          :on-failure (lambda (error)
                        (message "Failed to send image: %s"
                                 (or (map-elt error 'message) "unknown error"))
-                       (when delete-after
-                         (ignore-errors (delete-file file))))
+                       (funcall cleanup))
          :on-success
          (lambda (response)
-           (message "Sent %s" (file-name-nondirectory file))
+           (message "Sent %s" (file-name-nondirectory original))
            (let ((shown (or (wasabi-chat--keep-sent-image file (map-elt response 'Id))
                             file)))
            (when (buffer-live-p chat-buffer)
@@ -674,8 +687,136 @@ for a file made only to be sent."
                                                          (current-time))))
                   (:content . ,(wasabi-chat--sent-image-content shown caption)))))))
            ;; The kept copy is what the chat draws from now.
-           (when delete-after
-             (ignore-errors (delete-file file)))))))))
+           (funcall cleanup)))))))
+
+(defconst wasabi-chat--shrink-steps
+  '((1600 85) (1600 75) (1280 70) (1024 65) (800 60))
+  "Longest side and JPEG quality to try, in turn, to make an image fit.
+The first is about what WhatsApp itself sends a photo as.")
+
+(defconst wasabi-chat--w32-shrink-script
+  "$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Drawing
+$in = '%s'
+$out = '%s'
+$limit = %d
+$steps = @(%s)
+$codec = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+  Where-Object { $_.MimeType -eq 'image/jpeg' }
+$source = [Drawing.Image]::FromFile($in)
+try {
+  foreach ($step in $steps) {
+    $scale = [Math]::Min(1.0, $step[0] / [Math]::Max($source.Width, $source.Height))
+    $width = [Math]::Max(1, [int]($source.Width * $scale))
+    $height = [Math]::Max(1, [int]($source.Height * $scale))
+    $bitmap = New-Object Drawing.Bitmap $width, $height
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    $graphics.Clear([Drawing.Color]::White)
+    $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $graphics.DrawImage($source, 0, 0, $width, $height)
+    $graphics.Dispose()
+    $parameters = New-Object Drawing.Imaging.EncoderParameters 1
+    $parameters.Param[0] = New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality, [long]$step[1])
+    $bitmap.Save($out, $codec, $parameters)
+    $bitmap.Dispose()
+    if ((Get-Item -LiteralPath $out).Length -le $limit) {
+      Write-Output ('FITTED ' + $width + 'x' + $height)
+      exit 0
+    }
+  }
+} finally {
+  $source.Dispose()
+}
+exit 1"
+  "PowerShell that re-encodes an image as a JPEG small enough to send.
+Fills in the image, the JPEG to write, the byte limit and the steps
+to try; transparency becomes white, as JPEG has none.")
+
+(defun wasabi-chat--powershell (script)
+  "Run SCRIPT in PowerShell and return its standard output, or nil.
+Returns nil when it exits unsuccessfully.  Encoded, so that nothing in
+it needs quoting; standard error, where PowerShell writes progress
+records as CLIXML when given an encoded command, is left out."
+  (when (executable-find "powershell")
+    (let ((coding-system-for-read 'utf-8))
+      (with-temp-buffer
+        (and (zerop (call-process "powershell" nil (list t nil) nil
+                                  "-NoProfile" "-NonInteractive" "-STA"
+                                  "-EncodedCommand"
+                                  (base64-encode-string
+                                   (encode-coding-string script 'utf-16le) t)))
+             (buffer-string))))))
+
+(defun wasabi-chat--powershell-quote (string)
+  "Return STRING quoted for a single-quoted PowerShell string."
+  (string-replace "'" "''" string))
+
+(defun wasabi-chat--shrink-image (file jpeg)
+  "Re-encode the image FILE as JPEG, small enough to send.
+Returns non-nil if it could, nil if it could not be made to fit or
+there is nothing to do it with: PowerShell on Windows, and ImageMagick
+elsewhere."
+  (let ((fits (lambda ()
+                (and (file-exists-p jpeg)
+                     (<= (file-attribute-size (file-attributes jpeg))
+                         wasabi-chat--max-image-bytes)))))
+    (if (memq system-type '(windows-nt cygwin))
+        (let ((output (wasabi-chat--powershell
+                       (format wasabi-chat--w32-shrink-script
+                               (wasabi-chat--powershell-quote
+                                (convert-standard-filename file))
+                               (wasabi-chat--powershell-quote
+                                (convert-standard-filename jpeg))
+                               wasabi-chat--max-image-bytes
+                               (mapconcat (lambda (step)
+                                            (format "@(%d, %d)" (car step) (cadr step)))
+                                          wasabi-chat--shrink-steps
+                                          ", ")))))
+          (and output (string-match-p "^FITTED " output) (funcall fits)))
+      ;; Not "convert" on Windows, which is a disk utility there.
+      (when-let ((magick (or (executable-find "magick")
+                             (executable-find "convert"))))
+        (seq-some (lambda (step)
+                    (and (ignore-errors
+                           (zerop (call-process magick nil nil nil
+                                                (concat file "[0]")
+                                                "-resize" (format "%dx%d>" (car step) (car step))
+                                                "-background" "white" "-flatten"
+                                                "-quality" (number-to-string (cadr step))
+                                                jpeg)))
+                         (funcall fits)))
+                  wasabi-chat--shrink-steps)))))
+
+(defun wasabi-chat--fit-image (file)
+  "Return (FILE . nil) if wuzapi can take FILE as it is.
+Otherwise return (JPEG . t), a smaller copy made to be sent and then
+deleted, or signal a `user-error' when there is no making one.
+
+wuzapi exits altogether when handed a request much over 512 KB, which
+an image as small as 380 KB makes, so a larger one is shrunk the way
+WhatsApp would shrink it anyway."
+  (if (<= (file-attribute-size (file-attributes file))
+          wasabi-chat--max-image-bytes)
+      (cons file nil)
+    (let ((jpeg (make-temp-file "wasabi-send-" nil ".jpg")))
+      (if (wasabi-chat--shrink-image file jpeg)
+          (progn
+            (message "Shrunk %s from %s to %s to send it"
+                     (file-name-nondirectory file)
+                     (file-size-human-readable
+                      (file-attribute-size (file-attributes file)))
+                     (file-size-human-readable
+                      (file-attribute-size (file-attributes jpeg))))
+            (cons jpeg t))
+        (ignore-errors (delete-file jpeg))
+        (user-error "%s is %s, over the %s wuzapi takes, and could not be shrunk%s"
+                    (file-name-nondirectory file)
+                    (file-size-human-readable
+                     (file-attribute-size (file-attributes file)))
+                    (file-size-human-readable wasabi-chat--max-image-bytes)
+                    (if (memq system-type '(windows-nt cygwin))
+                        ""
+                      ": install ImageMagick to have it done"))))))
 
 (defconst wasabi-chat--w32-clipboard-script
   "[Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -711,28 +852,16 @@ Emacs itself can only read text from the clipboard on Windows.")
 (defun wasabi-chat--clipboard-image-w32 (png)
   "Find an image on the Windows clipboard, saving a picture to PNG.
 Returns (FILE . TEMPORARY), or nil if there is no image to be had."
-  (when (executable-find "powershell")
-    (let* ((script (format wasabi-chat--w32-clipboard-script
-                           (string-replace "'" "''" (convert-standard-filename png))))
-           ;; Encoded, so that nothing in the script or path needs quoting.
-           (encoded (base64-encode-string (encode-coding-string script 'utf-16le) t))
-           (coding-system-for-read 'utf-8)
-           (output (with-temp-buffer
-                     ;; Standard error is left out: PowerShell writes
-                     ;; progress records there, as CLIXML, when given an
-                     ;; encoded command.
-                     (and (zerop (call-process "powershell" nil (list t nil) nil
-                                               "-NoProfile" "-NonInteractive" "-STA"
-                                               "-EncodedCommand" encoded))
-                          (buffer-string))))
-           (answer (wasabi-chat--clipboard-script-answer output)))
-      (pcase answer
-        (`(image . ,_)
-         (when (wasabi-chat--png-file-p png)
-           (cons png t)))
-        (`(file . ,file)
-         (when (file-readable-p file)
-           (cons file nil)))))))
+  (pcase (wasabi-chat--clipboard-script-answer
+          (wasabi-chat--powershell
+           (format wasabi-chat--w32-clipboard-script
+                   (wasabi-chat--powershell-quote (convert-standard-filename png)))))
+    (`(image . ,_)
+     (when (wasabi-chat--png-file-p png)
+       (cons png t)))
+    (`(file . ,file)
+     (when (file-readable-p file)
+       (cons file nil)))))
 
 (defun wasabi-chat--clipboard-script-answer (output)
   "Return what the clipboard script's OUTPUT says it found.
@@ -809,11 +938,15 @@ copied in a file manager, which is sent as it is."
 A TEMPORARY file is deleted afterwards, or at once if not sent."
   (let ((file (car found))
         (temporary (cdr found)))
-    (condition-case nil
+    (condition-case err
         (wasabi-chat-send-image file (wasabi-chat--read-caption-for file) temporary)
       (quit
        (when temporary (ignore-errors (delete-file file)))
-       (message "Not sent")))))
+       (message "Not sent"))
+      ;; Too large to send, say: no send is left to clean up after it.
+      (user-error
+       (when temporary (ignore-errors (delete-file file)))
+       (signal (car err) (cdr err))))))
 
 (defun wasabi-chat-send-clipboard-image ()
   "Send the image on the clipboard to this chat.
