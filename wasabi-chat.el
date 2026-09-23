@@ -679,6 +679,7 @@ for a file made only to be sent."
 
 (defconst wasabi-chat--w32-clipboard-script
   "[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$ProgressPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $out = '%s'
 $image = [Windows.Forms.Clipboard]::GetImage()
@@ -717,17 +718,35 @@ Returns (FILE . TEMPORARY), or nil if there is no image to be had."
            (encoded (base64-encode-string (encode-coding-string script 'utf-16le) t))
            (coding-system-for-read 'utf-8)
            (output (with-temp-buffer
-                     (and (zerop (call-process "powershell" nil t nil
+                     ;; Standard error is left out: PowerShell writes
+                     ;; progress records there, as CLIXML, when given an
+                     ;; encoded command.
+                     (and (zerop (call-process "powershell" nil (list t nil) nil
                                                "-NoProfile" "-NonInteractive" "-STA"
                                                "-EncodedCommand" encoded))
-                          (string-trim (buffer-string))))))
-      (cond
-       ((and output (string-prefix-p "IMAGE " output) (wasabi-chat--png-file-p png))
-        (cons png t))
-       ((and output (string-prefix-p "FILE " output))
-        (let ((file (string-remove-prefix "FILE " output)))
-          (when (file-readable-p file)
-            (cons file nil))))))))
+                          (buffer-string))))
+           (answer (wasabi-chat--clipboard-script-answer output)))
+      (pcase answer
+        (`(image . ,_)
+         (when (wasabi-chat--png-file-p png)
+           (cons png t)))
+        (`(file . ,file)
+         (when (file-readable-p file)
+           (cons file nil)))))))
+
+(defun wasabi-chat--clipboard-script-answer (output)
+  "Return what the clipboard script's OUTPUT says it found.
+\(image . PATH), (file . PATH), or nil.  Looked for on a line of its
+own, so that anything else PowerShell prints does not hide it."
+  (when (stringp output)
+    (seq-some (lambda (line)
+                (let ((line (string-trim line)))
+                  (cond
+                   ((string-prefix-p "IMAGE " line)
+                    (cons 'image (string-remove-prefix "IMAGE " line)))
+                   ((string-prefix-p "FILE " line)
+                    (cons 'file (string-remove-prefix "FILE " line))))))
+              (split-string output "[\r\n]+" t))))
 
 (defun wasabi-chat--clipboard-image-gui (png)
   "Save the clipboard's image to PNG through Emacs, where it can.
