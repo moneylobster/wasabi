@@ -441,5 +441,137 @@
       ;; Standard output to the buffer, standard error discarded.
       (should (equal destination '(t nil))))))
 
+;;; Fitting what wuzapi can take
+
+(defun wasabi-send-image-test--write-bytes (name size)
+  "Write a PNG called NAME padded out to SIZE bytes, returning its path."
+  (let ((file (wasabi-send-image-test--write name)))
+    (let ((coding-system-for-write 'binary))
+      (write-region (make-string (- size (file-attribute-size (file-attributes file))) ?x)
+                    nil file t 'silent))
+    file))
+
+(ert-deftest wasabi-send-image-test-limit-keeps-wuzapi-alive ()
+  ;; wuzapi reads a request line of at most 512 KB and exits past it.
+  ;; An image at the limit, base64-encoded, must leave room to spare.
+  (should (< (+ 1024 (ceiling (* 4 wasabi-chat--max-image-bytes) 3))
+             (* 512 1024))))
+
+(ert-deftest wasabi-send-image-test-small-image-goes-as-it-is ()
+  (let* ((file (wasabi-send-image-test--write "small.png"))
+         (fitted (wasabi-chat--fit-image file)))
+    (should (equal fitted (cons file nil)))))
+
+(ert-deftest wasabi-send-image-test-large-image-is-shrunk ()
+  (let ((file (wasabi-send-image-test--write-bytes
+               "big.png" (+ wasabi-chat--max-image-bytes 1000))))
+    (cl-letf (((symbol-function 'wasabi-chat--shrink-image)
+               (lambda (_file jpeg)
+                 (with-temp-file jpeg (insert "small enough"))
+                 t)))
+      (let ((fitted (wasabi-chat--fit-image file)))
+        (unwind-protect
+            (progn
+              (should (string-suffix-p ".jpg" (car fitted)))
+              ;; Made to be sent, so it goes afterwards.
+              (should (cdr fitted))
+              ;; And the original is left alone.
+              (should (file-exists-p file)))
+          (delete-file (car fitted)))))))
+
+(ert-deftest wasabi-send-image-test-unshrinkable-image-is-refused ()
+  (let ((file (wasabi-send-image-test--write-bytes
+               "big.png" (+ wasabi-chat--max-image-bytes 1000)))
+        (made nil))
+    (cl-letf* ((real-make-temp-file (symbol-function 'make-temp-file))
+               ((symbol-function 'make-temp-file)
+                (lambda (&rest args) (setq made (apply real-make-temp-file args))))
+               ((symbol-function 'wasabi-chat--shrink-image) (lambda (&rest _) nil)))
+      ;; Refused before it can reach wuzapi, rather than crashing it.
+      (should-error (wasabi-chat--fit-image file) :type 'user-error)
+      (should-not (file-exists-p made)))))
+
+(ert-deftest wasabi-send-image-test-shrinks-with-imagemagick-elsewhere ()
+  (let ((system-type 'gnu/linux)
+        (file (wasabi-send-image-test--write "in.png"))
+        (jpeg (make-temp-file "wasabi-test" nil ".jpg"))
+        (calls '()))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (name) (and (equal name "magick") "/usr/bin/magick")))
+              ((symbol-function 'call-process)
+               (lambda (_program _infile _destination _display &rest args)
+                 (push args calls)
+                 ;; Too large at the first step, small enough at the second.
+                 (with-temp-file (car (last args))
+                   (insert (make-string (if (cdr calls) 10
+                                          (1+ wasabi-chat--max-image-bytes))
+                                        ?x)))
+                 0)))
+      (should (wasabi-chat--shrink-image file jpeg))
+      (should (equal (length calls) 2))
+      ;; Only ever shrunk, never enlarged, and flattened onto white.
+      (should (member "1600x1600>" (car (last calls))))
+      (should (member "-flatten" (car calls))))))
+
+(ert-deftest wasabi-send-image-test-not-convert-on-windows ()
+  ;; convert.exe on Windows is a disk utility, not ImageMagick.
+  (let ((system-type 'windows-nt)
+        (ran nil))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (name) (and (equal name "convert") "C:/Windows/System32/convert.exe")))
+              ((symbol-function 'call-process)
+               (lambda (program &rest _) (setq ran program) 1)))
+      (should-not (wasabi-chat--shrink-image "in.png" "out.jpg"))
+      (should-not (equal ran "convert")))))
+
+(ert-deftest wasabi-send-image-test-shrunk-copy-cleaned-up-after-sending ()
+  (let* ((wasabi-data-dir (make-temp-file "wasabi-test" t))
+         (original (wasabi-send-image-test--write "clip.png"))
+         (shrunk (wasabi-send-image-test--write "shrunk.jpg"))
+         (sent-image nil))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi-chat--fit-image)
+                 (lambda (_file) (cons shrunk t)))
+                ((symbol-function 'wasabi--send-chat-send-image-request)
+                 (lambda (&rest args)
+                   (setq sent-image (plist-get args :image))
+                   (funcall (plist-get args :on-success)
+                            '((Timestamp . 1790000000) (Id . "3EBFIT")))))
+                ((symbol-function 'wasabi-chat--append-message) #'ignore))
+        (wasabi-chat-send-image original nil t)
+        ;; What went out was the shrunk copy, as a JPEG.
+        (should (string-prefix-p "data:image/jpeg;base64," sent-image))
+        ;; Both temporary files gone, the kept copy there to draw from.
+        (should-not (file-exists-p shrunk))
+        (should-not (file-exists-p original))
+        (should (wasabi-chat--sent-image-file "3EBFIT"))))))
+
+(ert-deftest wasabi-send-image-test-picked-file-survives-shrinking ()
+  ;; A file picked to send is the user's own: only the copy goes.
+  (let* ((wasabi-data-dir (make-temp-file "wasabi-test" t))
+         (original (wasabi-send-image-test--write "holiday.png"))
+         (shrunk (wasabi-send-image-test--write "shrunk.jpg")))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi-chat--fit-image)
+                 (lambda (_file) (cons shrunk t)))
+                ((symbol-function 'wasabi--send-chat-send-image-request)
+                 (lambda (&rest args)
+                   (funcall (plist-get args :on-failure) '((message . "no"))))))
+        (wasabi-chat-send-image original nil)
+        (should-not (file-exists-p shrunk))
+        (should (file-exists-p original))))))
+
+(ert-deftest wasabi-send-image-test-too-large-clipboard-image-cleaned-up ()
+  (let ((file (wasabi-send-image-test--write "clip.png")))
+    (wasabi-send-image-test--in-chat
+      (cl-letf (((symbol-function 'wasabi-chat--clipboard-image)
+                 (lambda () (cons file t)))
+                ((symbol-function 'wasabi-chat--read-caption-for)
+                 (lambda (_file) ""))
+                ((symbol-function 'wasabi-chat--fit-image)
+                 (lambda (_file) (user-error "Too large"))))
+        (should-error (wasabi-chat-attach) :type 'user-error)
+        (should-not (file-exists-p file))))))
+
 (provide 'wasabi-send-image-test)
 ;;; wasabi-send-image-test.el ends here
