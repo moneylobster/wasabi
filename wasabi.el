@@ -2065,9 +2065,14 @@ Returns list of (date-label . chats-for-that-date)."
                                     (= (decoded-time-day date-time)
                                        (decoded-time-day yesterday)))
                                "Yesterday")
-                              ;; Other dates - format as "Month Day"
+                              ;; Other dates this year - "Month Day"
+                              ((= (decoded-time-year date-time)
+                                  (decoded-time-year today))
+                               (format-time-string "%B %e" timestamp))
+                              ;; Earlier years need theirs, or a day a
+                              ;; year ago lands in this year's group.
                               (t
-                               (format-time-string "%B %e" timestamp)))
+                               (format-time-string "%B %e, %Y" timestamp)))
                            ;; No timestamp - use "Sometime"
                            "Sometime"))
              (date-group (map-elt date-groups date-label)))

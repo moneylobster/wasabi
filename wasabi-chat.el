@@ -56,6 +56,9 @@
 (declare-function wasabi--learn-from-message-info "wasabi")
 (declare-function wasabi--parse-timestamp "wasabi")
 (declare-function wasabi--push-name "wasabi")
+(declare-function wasabi--remember-chat-time "wasabi")
+(declare-function wasabi--reparse-chat-index "wasabi")
+(declare-function wasabi--send-chat-index-request "wasabi")
 (declare-function wasabi--save-jid-aliases "wasabi")
 (declare-function wasabi--same-chat-p "wasabi")
 (declare-function wasabi--timestamp-older-p "wasabi")
@@ -1148,6 +1151,7 @@ Shows different bindings depending on whether point is in input area."
                          (wasabi-chat--append-message message)
                          ;; Replying means having read what they sent.
                          (wasabi-chat--send-read-receipts))
+                       (wasabi-chat--note-sent chat-jid timestamp-str)
                        (with-current-buffer chat-buffer
                          (goto-char (point-max)))
                        (with-current-buffer chat-buffer
@@ -1155,6 +1159,22 @@ Shows different bindings depending on whether point is in input area."
                            ;; Recenter to bottom (based on `recenter-top-bottom')
                            (recenter (- -1 (min (max 0 scroll-margin)
 		                                (truncate (/ (window-body-height) 4.0)))) t)))))))))
+
+;;; What sending does to the chats list
+
+(defun wasabi-chat--note-sent (chat-jid timestamp)
+  "Date CHAT-JID by a message just sent to it at TIMESTAMP.
+
+Incoming messages move their chat up the chats list as they arrive, but
+nothing comes back for what we send, so this is where the chat moves.
+The index is fetched again too, for a chat this is the first message of."
+  (wasabi--remember-chat-time chat-jid timestamp)
+  (when-let ((buffer (get-buffer "*Wasabi*")))
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'wasabi-mode) wasabi--state)
+        (wasabi--save-jid-aliases)
+        (wasabi--reparse-chat-index)
+        (ignore-errors (wasabi--send-chat-index-request))))))
 
 (defconst wasabi-chat--sendable-image-types
   '(("jpg" . "image/jpeg")
@@ -1326,14 +1346,17 @@ for a file made only to be sent."
          (lambda (response)
            (message "Sent %s" (file-name-nondirectory original))
            (let ((shown (or (wasabi-chat--keep-sent-image file (map-elt response 'Id))
-                            file)))
+                            file))
+                 (timestamp (format-time-string
+                             "%Y-%m-%dT%H:%M:%S%z"
+                             (or (wasabi--parse-timestamp (map-elt response 'Timestamp))
+                                 (current-time)))))
+           (wasabi-chat--note-sent chat-jid timestamp)
            (when (buffer-live-p chat-buffer)
              (with-current-buffer chat-buffer
                (wasabi-chat--append-message
                 `((:sender-name . "Me")
-                  (:timestamp . ,(format-time-string "%Y-%m-%dT%H:%M:%S%z"
-                                                     (or (map-elt response 'Timestamp)
-                                                         (current-time))))
+                  (:timestamp . ,timestamp)
                   (:content . ,(wasabi-chat--sent-image-content shown caption))
                   ;; So it can be replied to straight away.
                   (:message-id . ,(map-elt response 'Id))
