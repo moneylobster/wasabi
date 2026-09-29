@@ -57,6 +57,7 @@
 (declare-function wasabi--learn-from-message-info "wasabi")
 (declare-function wasabi--parse-timestamp "wasabi")
 (declare-function wasabi--push-name "wasabi")
+(declare-function wasabi--normalize-jid "wasabi")
 (declare-function wasabi--remember-chat-time "wasabi")
 (declare-function wasabi--reparse-chat-index "wasabi")
 (declare-function wasabi--send-chat-index-request "wasabi")
@@ -903,8 +904,12 @@ tell them from the message itself."
                                           (seq-drop messages (1+ index))))
         (wasabi-chat--rerender-message updated)))))
 
-(defun wasabi-chat--render (message)
-  "Render internal MESSAGE as it sits in this chat."
+(cl-defun wasabi-chat--render
+    (message &key (latest-own-id (wasabi-chat--latest-own-id
+                                  (map-elt wasabi-chat--chat :messages))))
+  "Render internal MESSAGE as it sits in this chat.
+LATEST-OWN-ID is the ID of the last message we sent in it, the only one
+to say whether it was read; given, it saves looking it up again."
   (wasabi-chat--render-message
    :sender-name (map-elt message :sender-name)
    :timestamp (map-elt message :timestamp)
@@ -913,7 +918,199 @@ tell them from the message itself."
    :reactions (map-elt message :reactions)
    :message-id (map-elt message :message-id)
    :quote (map-elt message :quote)
-   :changes (map-elt message :changes)))
+   :changes (map-elt message :changes)
+   :receipt (when (and latest-own-id
+                       (equal (map-elt message :message-id) latest-own-id))
+              (wasabi-chat--render-receipt message))))
+
+;;; Receipts for what we sent
+
+(defvar wasabi-show-read-receipts)
+
+(defface wasabi-chat-receipt
+  '((t :inherit shadow :slant italic))
+  "Face for the line saying whether your latest message was read."
+  :group 'wasabi)
+
+(defvar wasabi-chat--receipts nil
+  "Hash table of message ID to the receipts it has had.
+Each value is an alist of :seen, when one last arrived, and :readers,
+an alist of reader JID to :name, :delivered and :read times.  Kept on
+disk: wuzapi passes receipts on but never stores them.")
+
+(defvar wasabi-chat--receipts-dirty nil
+  "Non-nil when `wasabi-chat--receipts' has yet to be written to disk.")
+
+(defvar wasabi-chat--receipts-save-timer nil
+  "Timer to write the receipts once a burst of them is over.")
+
+(defconst wasabi-chat--receipts-kept 2000
+  "How many messages' receipts to keep on disk, the most recent.
+Only each chat's latest message shows them, so older ones are no loss.")
+
+(defun wasabi-chat--receipts-file ()
+  "Return the file keeping the receipts seen."
+  (expand-file-name "message-receipts.eld" (wasabi-data-dir)))
+
+(defun wasabi-chat--receipts ()
+  "Return the table of receipts, loading it from disk the first time."
+  (unless wasabi-chat--receipts
+    (setq wasabi-chat--receipts (make-hash-table :test 'equal))
+    (ignore-errors
+      (when (file-exists-p (wasabi-chat--receipts-file))
+        (dolist (entry (with-temp-buffer
+                         (insert-file-contents (wasabi-chat--receipts-file))
+                         (read (current-buffer))))
+          (puthash (car entry) (cdr entry) wasabi-chat--receipts)))))
+  wasabi-chat--receipts)
+
+(defun wasabi-chat--save-receipts ()
+  "Write the most recent receipts to disk, if anything is new."
+  (setq wasabi-chat--receipts-save-timer nil)
+  (when wasabi-chat--receipts-dirty
+    (setq wasabi-chat--receipts-dirty nil)
+    (ignore-errors
+      (let ((entries '()))
+        (maphash (lambda (id receipts) (push (cons id receipts) entries))
+                 (wasabi-chat--receipts))
+        (setq entries (seq-take (sort entries
+                                      (lambda (a b)
+                                        (> (or (map-elt (cdr a) :seen) 0)
+                                           (or (map-elt (cdr b) :seen) 0))))
+                                wasabi-chat--receipts-kept))
+        (with-temp-file (wasabi-chat--receipts-file)
+          (let ((print-length nil) (print-level nil))
+            (prin1 entries (current-buffer))))))))
+
+(defun wasabi-chat--true-p (value)
+  "Return non-nil when JSON VALUE is true, however false was decoded."
+  (and value (not (memq value '(:false :json-false)))))
+
+(defun wasabi-chat--receipt (event state contacts)
+  "Return what the receipt EVENT, of STATE, says, or nil.
+
+An alist of :chat, :reader, :name, :ids, :kind, `read' or `delivered',
+and :time.  Only others' receipts for what we sent count: those from our
+own other devices, ReadSelf among them, say what we read.  CONTACTS
+name the reader."
+  (let ((kind (pcase state ("Read" 'read) ("Delivered" 'delivered)))
+        (ids (seq-filter #'stringp (append (map-elt event 'MessageIDs) nil)))
+        (reader (wasabi--normalize-jid (wasabi--jid-string (map-elt event 'Sender))))
+        (time (wasabi--parse-timestamp (map-elt event 'Timestamp))))
+    (when (and kind ids reader
+               (not (wasabi-chat--true-p (map-elt event 'IsFromMe))))
+      (list (cons :chat (wasabi--jid-string (map-elt event 'Chat)))
+            (cons :reader reader)
+            (cons :name (or (wasabi--contact-display-name reader contacts)
+                            (wasabi--jid-identifier reader)))
+            (cons :ids ids)
+            (cons :kind kind)
+            (cons :time (format-time-string "%Y-%m-%dT%H:%M:%S%z" time))))))
+
+(defun wasabi-chat--record-receipt (receipt)
+  "Record RECEIPT against each message it is for.
+Each reader's first delivery and first read are kept; a later receipt
+of the same kind changes nothing."
+  (let ((table (wasabi-chat--receipts))
+        (reader (map-elt receipt :reader))
+        (kind (if (eq (map-elt receipt :kind) 'read) :read :delivered)))
+    (dolist (id (map-elt receipt :ids))
+      (let* ((readers (copy-tree (map-elt (gethash id table) :readers)))
+             (seen (map-elt readers reader)))
+        (unless (map-elt seen kind)
+          (setf (alist-get reader readers nil nil #'equal)
+                (append (list (cons kind (map-elt receipt :time))
+                              (cons :name (map-elt receipt :name)))
+                        (assq-delete-all :name (assq-delete-all kind seen))))
+          (puthash id (list (cons :seen (float-time)) (cons :readers readers))
+                   table)
+          (setq wasabi-chat--receipts-dirty t))))
+    (when (and wasabi-chat--receipts-dirty
+               (not wasabi-chat--receipts-save-timer))
+      (setq wasabi-chat--receipts-save-timer
+            (run-with-idle-timer 2 nil #'wasabi-chat--save-receipts)))))
+
+(defun wasabi-chat--latest-own-id (messages)
+  "Return the ID of the last of MESSAGES that we sent, or nil."
+  (seq-some (lambda (message)
+              (and (map-elt message :from-me) (map-elt message :message-id)))
+            (reverse messages)))
+
+(defun wasabi-chat--render-receipt (message)
+  "Return the line saying whether MESSAGE was read, or nil if unknown.
+
+One to one: when it was read, or else delivered.  In a group: by how
+many, with who and when on hover."
+  (when-let* ((wasabi-show-read-receipts)
+              (id (map-elt message :message-id))
+              (readers (map-elt (gethash id (wasabi-chat--receipts)) :readers)))
+    (let* ((sent-at (map-elt message :timestamp))
+           (group (wasabi--group-jid-p (map-elt wasabi-chat--chat :chat-jid)))
+           (read (seq-filter (lambda (reader) (map-elt (cdr reader) :read)) readers))
+           (delivered (seq-filter (lambda (reader)
+                                    (and (map-elt (cdr reader) :delivered)
+                                         (not (map-elt (cdr reader) :read))))
+                                  readers))
+           (earliest (lambda (key)
+                       (car (sort (delq nil (mapcar (lambda (reader)
+                                                      (map-elt (cdr reader) key))
+                                                    readers))
+                                  #'wasabi--timestamp-older-p))))
+           (time (lambda (stamp) (or (wasabi-chat--change-time stamp sent-at) "")))
+           (list-of (lambda (heading who key)
+                      (when who
+                        (concat heading
+                                (mapconcat (lambda (reader)
+                                             (format "\n  %s  %s"
+                                                     (map-elt (cdr reader) :name)
+                                                     (funcall time (map-elt (cdr reader) key))))
+                                           ;; In the order they got to it.
+                                           (sort (copy-sequence who)
+                                                 (lambda (a b)
+                                                   (wasabi--timestamp-older-p
+                                                    (map-elt (cdr a) key)
+                                                    (map-elt (cdr b) key))))
+                                           "")))))
+           (text (cond ((and read group) (format "Read by %d" (length read)))
+                       (read (string-trim (concat "Read " (funcall time (funcall earliest :read)))))
+                       ((not delivered) nil)
+                       (group (format "Delivered to %d" (length delivered)))
+                       (t (string-trim (concat "Delivered "
+                                               (funcall time (funcall earliest :delivered))))))))
+      (when text
+        (propertize text
+                    'face 'wasabi-chat-receipt
+                    'wasabi-annotation t
+                    'help-echo (if group
+                                   (string-join (delq nil (list (funcall list-of "Read by:" read :read)
+                                                                (funcall list-of "Delivered to:" delivered :delivered)))
+                                                "\n")
+                                 (string-join
+                                  (delq nil
+                                        (list (when-let ((at (funcall earliest :delivered)))
+                                                (concat "Delivered " (funcall time at)))
+                                              (when-let ((at (funcall earliest :read)))
+                                                (concat "Read " (funcall time at)))))
+                                  "\n")))))))
+
+(defun wasabi-chat--rerender-id (id)
+  "Draw the message with ID again in place, if this chat has it."
+  (when-let ((message (and id
+                           (seq-find (lambda (message)
+                                       (equal (map-elt message :message-id) id))
+                                     (map-elt wasabi-chat--chat :messages)))))
+    (wasabi-chat--rerender-message message)))
+
+(defun wasabi-chat--redraw-latest-own ()
+  "Draw our latest message in this chat again, with its receipt line."
+  (wasabi-chat--rerender-id
+   (wasabi-chat--latest-own-id (map-elt wasabi-chat--chat :messages))))
+
+(defun wasabi-chat--apply-receipt (receipt)
+  "Show RECEIPT in this chat, if it is for our latest message here."
+  (let ((latest (wasabi-chat--latest-own-id (map-elt wasabi-chat--chat :messages))))
+    (when (member latest (map-elt receipt :ids))
+      (wasabi-chat--rerender-id latest))))
 
 (defun wasabi-chat--rerender-message (message)
   "Draw MESSAGE again in place, keeping the rest of the chat as it is.
@@ -1791,7 +1988,7 @@ MESSAGES is a list of already-parsed internal message alists."
   (wasabi-chat--load-stickers)
   (wasabi-chat--send-read-receipts))
 
-(cl-defun wasabi-chat--render-message (&key sender-name timestamp content max-sender-width reactions message-id ((:quote quoted)) changes)
+(cl-defun wasabi-chat--render-message (&key sender-name timestamp content max-sender-width reactions message-id ((:quote quoted)) changes receipt)
   "Render a single internal message.
 SENDER-NAME is the display name of the sender.
 TIMESTAMP is the ISO8601 timestamp string.
@@ -1800,7 +1997,8 @@ MAX-SENDER-WIDTH is used for padding alignment.
 REACTIONS is a list of reaction alists with :emoji and :sender keys.
 MESSAGE-ID is used to tag the rendered message for later updates.
 QUOTE, when the message is a reply, is the quote of what it replies to.
-CHANGES are the edits and deletion recorded against it, shown as notes."
+CHANGES are the edits and deletion recorded against it, shown as notes.
+RECEIPT, when given, is a line under it saying whether it was read."
   (let* ((col1-width max-sender-width)
          (is-from-me (string= sender-name "Me"))
          (sender (propertize sender-name
@@ -1835,7 +2033,8 @@ CHANGES are the edits and deletion recorded against it, shown as notes."
                       "\n" (make-string col1-width ?\s) " "))
             (string-replace "\n" (concat "\n " (make-string col1-width ?\s))
                             (concat content
-                                    (wasabi-chat--render-changes changes timestamp)))
+                                    (wasabi-chat--render-changes changes timestamp)
+                                    (when receipt (concat "\n" receipt))))
             ;; Add reactions below the message
             (when reactions
               (concat "\n"
@@ -1855,19 +2054,11 @@ CHANGES are the edits and deletion recorded against it, shown as notes."
 (defun wasabi-chat--render-messages (messages)
   "Render internal format MESSAGES to current buffer.
 MESSAGES is a list of alists with :sender-name, :timestamp, :content."
-  (let* ((max-sender-width (map-elt wasabi-chat--chat :max-sender-width))
+  (let* ((latest-own-id (wasabi-chat--latest-own-id messages))
          (message-lines
           (mapcar
            (lambda (msg)
-             (wasabi-chat--render-message
-              :sender-name (map-elt msg :sender-name)
-              :timestamp (map-elt msg :timestamp)
-              :content (map-elt msg :content)
-              :max-sender-width max-sender-width
-              :reactions (map-elt msg :reactions)
-              :message-id (map-elt msg :message-id)
-              :quote (map-elt msg :quote)
-              :changes (map-elt msg :changes)))
+             (wasabi-chat--render msg :latest-own-id latest-own-id))
            messages)))
     (let ((start (point))
           (day nil))
@@ -1922,7 +2113,9 @@ Updates :messages list and :max-sender-width in chat state."
            (old-max-width (or (map-elt wasabi-chat--chat :max-sender-width) 0))
            (new-max-width (max old-max-width sender-width))
            (updated-messages (append (map-elt wasabi-chat--chat :messages)
-                                     (list message))))
+                                     (list message)))
+           (previous-own-id (wasabi-chat--latest-own-id
+                             (map-elt wasabi-chat--chat :messages))))
       ;; Update chat state with new messages and max-width
       (when-let ((heading (wasabi-chat--day-heading
                            message
@@ -1932,17 +2125,15 @@ Updates :messages list and :max-sender-width in chat state."
       (wasabi-chat--update-chat :max-sender-width new-max-width)
       (wasabi-chat--update-chat :messages updated-messages)
       ;; Render the message
-      (insert (wasabi-chat--render-message
-               :sender-name (map-elt message :sender-name)
-               :timestamp (map-elt message :timestamp)
-               :content (map-elt message :content)
-               :max-sender-width (map-elt wasabi-chat--chat :max-sender-width)
-               :reactions (map-elt message :reactions)
-               :message-id (map-elt message :message-id)
-               :quote (map-elt message :quote)
-               :changes (map-elt message :changes)))
-      (put-text-property start (point) 'read-only t))
-    (wasabi-chat--setup-prompt)
+      (insert (wasabi-chat--render message))
+      (put-text-property start (point) 'read-only t)
+      (wasabi-chat--setup-prompt)
+      ;; Only the latest of what we sent says whether it was read, so
+      ;; the one before gives up its line.
+      (when (and (map-elt message :from-me)
+                 previous-own-id
+                 (not (equal previous-own-id (map-elt message :message-id))))
+        (wasabi-chat--rerender-id previous-own-id)))
     ;; Restore saved input
     (when (and saved-input (not (string-empty-p saved-input)))
       (goto-char (point-max))

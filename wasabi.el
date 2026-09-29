@@ -123,6 +123,15 @@ Toggle it for the session with `wasabi-toggle-read-receipts', bound to
   :type 'boolean
   :group 'wasabi)
 
+(defcustom wasabi-show-read-receipts t
+  "Non-nil to show whether your latest message in a chat was read.
+
+A dim line under it says when it was delivered or read; in a group, by
+how many, with their names on hover.  Toggle it for the session with
+`wasabi-toggle-read-receipt-display'."
+  :type 'boolean
+  :group 'wasabi)
+
 (defun wasabi-data-dir ()
   "Return the data directory, ensuring it exists.
 Creates the directory if it doesn't exist.
@@ -153,6 +162,8 @@ it is required internally by the process.")
 (defconst wasabi--event-subscriptions
   '("Message"
     "Receipt"
+    ;; What wuzapi actually calls receipts when it forwards them.
+    "ReadReceipt"
     "Connected"
     "Disconnected"
     "ConnectFailure"
@@ -1321,6 +1332,16 @@ Calls ON-FAILURE with error if download fails."
                              (wasabi--set-status
                               :type 'disconnected
                               :message (wasabi--refresh-error :message "Disconnected")))
+                            ((equal (map-elt notification 'method) "ReadReceipt")
+                             (when-let ((receipt (wasabi-chat--receipt
+                                                  (map-nested-elt notification '(params event))
+                                                  (map-nested-elt notification '(params state))
+                                                  (map-elt (wasabi--state) :contacts))))
+                               (wasabi-chat--record-receipt receipt)
+                               (when-let ((chat-buffer (wasabi-chat--find-buffer
+                                                        (map-elt receipt :chat))))
+                                 (with-current-buffer chat-buffer
+                                   (wasabi-chat--apply-receipt receipt)))))
                             ((equal (map-elt notification 'method) "Message")
                              (let* ((p-message (map-nested-elt notification '(params event Message)))
                                     (p-info (map-nested-elt notification '(params event Info)))
@@ -1992,6 +2013,21 @@ change what wasabi starts with."
         (wasabi--update-header-line))))
   (message "Wasabi read receipts %s"
            (if wasabi-send-read-receipts "on" "off")))
+
+(defun wasabi-toggle-read-receipt-display ()
+  "Show or hide whether your latest message in each chat was read.
+
+Lasts for this session.  Customize `wasabi-show-read-receipts' to
+change what wasabi starts with.  Receipts are recorded either way, so
+turning this back on shows them up to date."
+  (interactive)
+  (setq wasabi-show-read-receipts (not wasabi-show-read-receipts))
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (derived-mode-p 'wasabi-chat-mode)
+        (wasabi-chat--redraw-latest-own))))
+  (message "Wasabi read receipt display %s"
+           (if wasabi-show-read-receipts "on" "off")))
 
 (defun wasabi-open-data-directory ()
   "Open data directory (database, media, etc)."
