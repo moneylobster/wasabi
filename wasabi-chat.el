@@ -50,6 +50,7 @@
 (declare-function wasabi--send-download-video-request "wasabi")
 (declare-function wasabi--canonical-jid "wasabi")
 (declare-function wasabi--contact-display-name "wasabi")
+(declare-function wasabi--date-label "wasabi")
 (declare-function wasabi--group-jid-p "wasabi")
 (declare-function wasabi--jid-identifier "wasabi")
 (declare-function wasabi--jid-string "wasabi")
@@ -715,6 +716,11 @@ Messages with reactions will have a :reactions field."
 
 ;;; Edits and deletions
 
+(defface wasabi-chat-day-heading
+  '((t :inherit (shadow bold)))
+  "Face for the heading over each day's messages in a chat."
+  :group 'wasabi)
+
 (defface wasabi-chat-deleted
   '((t :inherit error :slant italic :weight normal))
   "Face for the note that a message has been deleted."
@@ -930,7 +936,17 @@ Unlike a refresh, this leaves whatever is being typed alone."
                         (save-excursion
                           (goto-char next-sender)
                           (line-beginning-position))
-                      (or wasabi-chat--prompt-marker (point-max)))))
+                      (or wasabi-chat--prompt-marker (point-max))))
+               ;; Short of the next day's heading, which is not this
+               ;; message's to redraw.
+               (heading (and after-sender
+                             (text-property-any after-sender end
+                                                'wasabi-day-heading t)))
+               (end (if heading
+                        (save-excursion
+                          (goto-char heading)
+                          (line-beginning-position))
+                      end)))
           (delete-region start end)
           (goto-char start)
           (insert (wasabi-chat--render message))
@@ -1853,9 +1869,37 @@ MESSAGES is a list of alists with :sender-name, :timestamp, :content."
               :quote (map-elt msg :quote)
               :changes (map-elt msg :changes)))
            messages)))
-    (let ((start (point)))
-      (insert "\n" (mapconcat #'identity message-lines))
+    (let ((start (point))
+          (day nil))
+      (insert "\n")
+      (seq-mapn (lambda (message line)
+                  (when-let ((heading (wasabi-chat--day-heading message day)))
+                    (insert heading)
+                    (setq day (wasabi-chat--day message)))
+                  (insert line))
+                messages message-lines)
       (put-text-property start (point) 'read-only t))))
+
+(defun wasabi-chat--day (message)
+  "Return the day MESSAGE was sent, as YYYY-MM-DD, or nil if unknown."
+  (when-let ((time (wasabi--parse-timestamp (map-elt message :timestamp))))
+    (format-time-string "%F" time)))
+
+(defun wasabi-chat--day-heading (message previous-day)
+  "Return the heading to put over MESSAGE, or nil for none.
+There is one where a message starts a day other than PREVIOUS-DAY, the
+day of the dated message before it.  A message with no readable date
+gets none, and is taken to belong to the day it is shown in."
+  (when-let* ((time (wasabi--parse-timestamp (map-elt message :timestamp)))
+              ((not (equal (format-time-string "%F" time) previous-day))))
+    (concat (propertize (concat "── " (wasabi--date-label time) " ──")
+                        'face 'wasabi-chat-day-heading
+                        'wasabi-day-heading t)
+            "\n\n")))
+
+(defun wasabi-chat--last-day (messages)
+  "Return the day of the last dated message in MESSAGES, or nil."
+  (seq-some #'wasabi-chat--day (reverse messages)))
 
 (defun wasabi-chat--append-message (message)
   "Append a single internal MESSAGE to current chat buffer.
@@ -1880,6 +1924,11 @@ Updates :messages list and :max-sender-width in chat state."
            (updated-messages (append (map-elt wasabi-chat--chat :messages)
                                      (list message))))
       ;; Update chat state with new messages and max-width
+      (when-let ((heading (wasabi-chat--day-heading
+                           message
+                           (wasabi-chat--last-day
+                            (map-elt wasabi-chat--chat :messages)))))
+        (insert heading))
       (wasabi-chat--update-chat :max-sender-width new-max-width)
       (wasabi-chat--update-chat :messages updated-messages)
       ;; Render the message
@@ -1924,47 +1973,7 @@ Finds the message in :messages, updates it, and re-renders just that message."
       (progn
         (wasabi--log "Found message at index %d, message-id: %s" target-idx (map-elt target-msg :message-id))
         (wasabi-chat--update-chat :messages updated-messages)
-        (let ((inhibit-read-only t))
-          (save-excursion
-            ;; Find message by its message-id text property using text-property-search-forward
-            (wasabi--log "Looking for message-id in buffer: %s" target-id)
-            (goto-char (point-min))
-            (when-let* ((match (text-property-search-forward 'wasabi-message-id target-id #'equal))
-                        (prop-pos (prop-match-beginning match)))
-              ;; prop-pos is somewhere in the sender text, find the start of the line
-              (goto-char prop-pos)
-              (beginning-of-line)
-              (let* ((msg-start (point))
-                     ;; Find the next message by looking for the next wasabi-sender property
-                     ;; First, move past the current sender property
-                     (after-sender (next-single-property-change prop-pos 'wasabi-sender))
-                     ;; Then find the next sender (start of next message)
-                     (next-sender (when after-sender
-                                    (next-single-property-change after-sender 'wasabi-sender)))
-                     ;; If there's a next message, find its line start; otherwise use prompt marker
-                     (msg-end (if next-sender
-                                  (save-excursion
-                                    (goto-char next-sender)
-                                    (beginning-of-line)
-                                    ;; Skip back over the \n\n separator
-                                    (skip-chars-backward "\n")
-                                    (point))
-                                ;; Last message: stop at prompt marker (or point-max if no prompt)
-                                (or wasabi-chat--prompt-marker (point-max)))))
-                (delete-region msg-start msg-end)
-                (goto-char msg-start)
-                (insert (wasabi-chat--render-message
-                         :sender-name (map-elt updated-msg :sender-name)
-                         :timestamp (map-elt updated-msg :timestamp)
-                         :content (map-elt updated-msg :content)
-                         :max-sender-width (map-elt wasabi-chat--chat :max-sender-width)
-                         :reactions (map-elt updated-msg :reactions)
-                         :message-id (map-elt updated-msg :message-id)
-                         :quote (map-elt updated-msg :quote)
-                         :changes (map-elt updated-msg :changes)))
-                ;; Ensure newline before prompt.
-                (unless next-sender
-                  (insert "\n\n")))))))
+        (wasabi-chat--rerender-message updated-msg))
     (wasabi--log "Could not find message with ID %s to add reaction" target-id)))
 
 (defun wasabi-chat--find-buffer (chat-jid)

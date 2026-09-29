@@ -2037,42 +2037,31 @@ code in WhatsApp mobile: Settings -> Linked Devices -> Link a Device
 
 (defalias 'wasabi-new-message #'wasabi-new-chat)
 
+(defun wasabi--date-label (time)
+  "Name the day of TIME: Today, Yesterday, or its date.
+The date takes its year only outside this one, where it is needed to
+tell one September 22 from another."
+  (let ((date (decode-time time))
+        (today (decode-time))
+        (yesterday (decode-time (time-subtract nil (* 24 60 60)))))
+    (cl-flet ((same-day-p (a b)
+                (and (= (decoded-time-year a) (decoded-time-year b))
+                     (= (decoded-time-month a) (decoded-time-month b))
+                     (= (decoded-time-day a) (decoded-time-day b)))))
+      (cond ((same-day-p date today) "Today")
+            ((same-day-p date yesterday) "Yesterday")
+            ((= (decoded-time-year date) (decoded-time-year today))
+             (format-time-string "%B %-d" time))
+            (t (format-time-string "%B %-d, %Y" time))))))
+
 (defun wasabi--group-chats-by-date (chats-index)
   "Group CHATS-INDEX by date labels (Today, Yesterday, or date).
 Returns list of (date-label . chats-for-that-date)."
-  (let ((date-groups '())
-        (today (decode-time))
-        (yesterday (decode-time (time-subtract nil (* 24 60 60)))))
+  (let ((date-groups '()))
     (dolist (chat chats-index)
       (let* ((timestamp (wasabi--parse-timestamp (map-elt chat :last-updated)))
-             (date-time (when timestamp
-                          (decode-time timestamp)))
-             (date-label (if date-time
-                             (cond
-                              ;; Today
-                              ((and (= (decoded-time-year date-time)
-                                       (decoded-time-year today))
-                                    (= (decoded-time-month date-time)
-                                       (decoded-time-month today))
-                                    (= (decoded-time-day date-time)
-                                       (decoded-time-day today)))
-                               "Today")
-                              ;; Yesterday
-                              ((and (= (decoded-time-year date-time)
-                                       (decoded-time-year yesterday))
-                                    (= (decoded-time-month date-time)
-                                       (decoded-time-month yesterday))
-                                    (= (decoded-time-day date-time)
-                                       (decoded-time-day yesterday)))
-                               "Yesterday")
-                              ;; Other dates this year - "Month Day"
-                              ((= (decoded-time-year date-time)
-                                  (decoded-time-year today))
-                               (format-time-string "%B %e" timestamp))
-                              ;; Earlier years need theirs, or a day a
-                              ;; year ago lands in this year's group.
-                              (t
-                               (format-time-string "%B %e, %Y" timestamp)))
+             (date-label (if timestamp
+                             (wasabi--date-label timestamp)
                            ;; No timestamp - use "Sometime"
                            "Sometime"))
              (date-group (map-elt date-groups date-label)))
