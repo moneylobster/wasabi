@@ -1788,6 +1788,8 @@ FACE when non-nil applies the specified face to the text."
 
 \\{wasabi-mode-map}"
   (setq buffer-read-only t)
+  ;; Every line is a chat, so mark the one RET opens.
+  (hl-line-mode 1)
   (wasabi--update-header-line)
   (goto-char (point-max)))
 
@@ -2073,10 +2075,10 @@ code in WhatsApp mobile: Settings -> Linked Devices -> Link a Device
 
 (defalias 'wasabi-new-message #'wasabi-new-chat)
 
-(defun wasabi--date-label (time)
+(defun wasabi--date-label (time &optional short)
   "Name the day of TIME: Today, Yesterday, or its date.
 The date takes its year only outside this one, where it is needed to
-tell one September 22 from another."
+tell one September 22 from another.  SHORT abbreviates the month."
   (let ((date (decode-time time))
         (today (decode-time))
         (yesterday (decode-time (time-subtract nil (* 24 60 60)))))
@@ -2087,8 +2089,8 @@ tell one September 22 from another."
       (cond ((same-day-p date today) "Today")
             ((same-day-p date yesterday) "Yesterday")
             ((= (decoded-time-year date) (decoded-time-year today))
-             (format-time-string "%B %-d" time))
-            (t (format-time-string "%B %-d, %Y" time))))))
+             (format-time-string (if short "%b %-d" "%B %-d") time))
+            (t (format-time-string (if short "%b %-d, %Y" "%B %-d, %Y") time))))))
 
 (defun wasabi--group-chats-by-date (chats-index)
   "Group CHATS-INDEX by date labels (Today, Yesterday, or date).
@@ -2127,6 +2129,42 @@ LAST-UPDATED is the protocol timestamp string."
             " "
             display-name)))
 
+(defun wasabi--chat-list-lines (chats-index)
+  "Return the chats list's lines for CHATS-INDEX, one per chat.
+
+The day sits in a column of its own, on each day's first chat only, so
+the days still read as groups while every line is a chat to open."
+  (let* ((groups (wasabi--group-chats-by-date chats-index))
+         (labels (mapcar (lambda (group)
+                           (if-let ((time (wasabi--parse-timestamp
+                                           (map-elt (cadr group) :last-updated))))
+                               (wasabi--date-label time t)
+                             (car group)))
+                         groups))
+         (width (apply #'max 0 (mapcar #'string-width labels)))
+         (lines '()))
+    (seq-mapn
+     (lambda (group label)
+       (let ((first t))
+         (dolist (chat (cdr group))
+           (push (wasabi--add-action-to-text
+                  (concat (propertize (string-pad (if first label "") width)
+                                      'face 'bold)
+                          "  "
+                          (wasabi--format-chat-preview
+                           :display-name (map-elt chat :display-name)
+                           :is-group (map-elt chat :is-group)
+                           :last-updated (map-elt chat :last-updated)))
+                  (lambda ()
+                    (interactive)
+                    (wasabi--send-chat-history-request
+                     :chat-jid (map-elt chat :chat-jid)
+                     :contact-name (map-elt chat :display-name))))
+                 lines)
+           (setq first nil))))
+     groups labels)
+    (nreverse lines)))
+
 (defun wasabi--refresh ()
   "Refresh the display based on current status."
   (let* ((status (map-elt (wasabi--state) :status))
@@ -2152,33 +2190,11 @@ LAST-UPDATED is the protocol timestamp string."
                                 (propertize "c" 'face 'help-key-binding)
                                 " "
                                 "to start a new chat"))))
-        ;; Render chat list
-        (let ((sections (mapcar
-                         (lambda (date-group)
-                           (let* ((date-label (car date-group))
-                                  (chats (cdr date-group))
-                                  (chat-lines
-                                   (mapcar
-                                    (lambda (chat)
-                                      (wasabi--add-action-to-text
-                                       (wasabi--format-chat-preview
-                                        :display-name (map-elt chat :display-name)
-                                        :is-group (map-elt chat :is-group)
-                                        :last-updated (map-elt chat :last-updated))
-                                       (lambda ()
-                                         (interactive)
-                                         (wasabi--send-chat-history-request
-                                          :chat-jid (map-elt chat :chat-jid)
-                                          :contact-name (map-elt chat :display-name)))))
-                                    chats)))
-                             (concat (propertize date-label 'face 'bold)
-                                     "\n\n"
-                                     (mapconcat #'identity chat-lines "\n"))))
-                         (wasabi--group-chats-by-date chats-index))))
+        ;; Render chat list: every line a chat.
+        (progn
           (let ((inhibit-read-only t))
             (erase-buffer)
-            (insert "\n")
-            (insert (mapconcat #'identity sections "\n\n")))
+            (insert (mapconcat #'identity (wasabi--chat-list-lines chats-index) "\n")))
           ;; Restore point position
           (goto-char (point-min))
           (forward-line (1- saved-line))

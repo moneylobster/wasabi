@@ -50,6 +50,48 @@
   (should-not (member "Today" (wasabi-chat-list-test--labels
                                (time-subtract nil (* 365 24 60 60))))))
 
+;;; One line per chat
+
+(defun wasabi-chat-list-test--chat (name time)
+  "A chat list entry for NAME, last active at TIME, or undated if nil."
+  (list (cons :chat-jid (concat name "@s.whatsapp.net"))
+        (cons :display-name name)
+        (cons :last-updated (and time (format-time-string "%Y-%m-%dT%H:%M:%S%z" time)))))
+
+(ert-deftest wasabi-chat-list-test-every-line-a-chat ()
+  (let* ((now (current-time))
+         (long-ago (time-subtract nil (* 400 24 60 60)))
+         (lines (mapcar #'substring-no-properties
+                        (wasabi--chat-list-lines
+                         (list (wasabi-chat-list-test--chat "John" now)
+                               (wasabi-chat-list-test--chat "Mary" now)
+                               (wasabi-chat-list-test--chat "Alice" long-ago)
+                               (wasabi-chat-list-test--chat "Bob" nil)))))
+         (old-label (format-time-string "%b %-d, %Y" long-ago)))
+    (should (equal (length lines) 4))
+    ;; The day only on its first chat.
+    (should (string-prefix-p "Today " (nth 0 lines)))
+    (should (string-prefix-p " " (nth 1 lines)))
+    (should (string-prefix-p old-label (nth 2 lines)))
+    (should (string-prefix-p "Sometime" (nth 3 lines)))
+    ;; Names line up, however long the day's label.
+    (should (equal (length (seq-uniq
+                            (mapcar (lambda (line)
+                                      (string-match "\\(John\\|Mary\\|Alice\\|Bob\\)" line))
+                                    lines)))
+                   1))))
+
+(ert-deftest wasabi-chat-list-test-lines-open-their-chat ()
+  (let ((opened nil))
+    (cl-letf (((symbol-function 'wasabi--send-chat-history-request)
+               (lambda (&rest args) (setq opened (plist-get args :chat-jid)))))
+      (let ((line (cadr (wasabi--chat-list-lines
+                         (list (wasabi-chat-list-test--chat "John" (current-time))
+                               (wasabi-chat-list-test--chat "Mary" (current-time)))))))
+        ;; Anywhere on the line, the day's column included.
+        (funcall (lookup-key (get-text-property 0 'keymap line) (kbd "RET")))
+        (should (equal opened "Mary@s.whatsapp.net"))))))
+
 ;;; Sending moves a chat up
 
 (ert-deftest wasabi-chat-list-test-sending-dates-the-chat ()
