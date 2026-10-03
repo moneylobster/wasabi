@@ -30,6 +30,7 @@
 
 (eval-when-compile
   (require 'cl-lib))
+(require 'browse-url)
 (require 'map)
 (require 'parse-time)
 (require 'seq)
@@ -37,6 +38,7 @@
 (require 'wasabi-icon)
 
 (declare-function wasabi--add-action-to-text "wasabi")
+(declare-function wasabi--make-action-keymap "wasabi")
 (declare-function wasabi--buffer "wasabi")
 (declare-function wasabi--face-height-pixels "wasabi")
 (declare-function wasabi--header-graphical-p "wasabi")
@@ -2001,6 +2003,41 @@ MESSAGES is a list of already-parsed internal message alists."
   (wasabi-chat--load-stickers)
   (wasabi-chat--send-read-receipts))
 
+;;; Links
+
+(defun wasabi-chat--url-target (url)
+  "Return what to open for URL, as written in a message.
+A bare www. address is taken to be the web page it names."
+  (if (string-prefix-p "www." (downcase url))
+      (concat "https://" url)
+    url))
+
+(defun wasabi-chat--linkify (text)
+  "Return a copy of TEXT with each web address in it made a link.
+RET or a click opens it with `browse-url'.  Text that already does
+something, like an image or a sticker, is left as it is."
+  (let ((text (copy-sequence text))
+        (case-fold-search t)
+        (start 0))
+    (while (string-match browse-url-button-regexp text start)
+      (let* ((begin (match-beginning 0))
+             (end (match-end 0))
+             (target (wasabi-chat--url-target (match-string 0 text))))
+        (unless (text-property-not-all begin end 'keymap nil text)
+          (add-text-properties
+           begin end
+           (list 'keymap (wasabi--make-action-keymap
+                          (lambda ()
+                            (interactive)
+                            (browse-url target)))
+                 'face 'link
+                 'mouse-face 'highlight
+                 'help-echo (concat "RET: open " target)
+                 'wasabi-url target)
+           text))
+        (setq start end)))
+    text))
+
 (cl-defun wasabi-chat--render-message (&key sender-name timestamp content max-sender-width reactions message-id ((:quote quoted)) changes receipt)
   "Render a single internal message.
 SENDER-NAME is the display name of the sender.
@@ -2045,8 +2082,9 @@ RECEIPT, when given, is a line under it saying whether it was read."
               (concat (wasabi-chat--render-quote quoted)
                       "\n" (make-string col1-width ?\s) " "))
             (string-replace "\n" (concat "\n " (make-string col1-width ?\s))
-                            (concat content
-                                    (wasabi-chat--render-changes changes timestamp)
+                            (concat (wasabi-chat--linkify
+                                     (concat content
+                                             (wasabi-chat--render-changes changes timestamp)))
                                     (when receipt (concat "\n" receipt))))
             ;; Add reactions below the message
             (when reactions
