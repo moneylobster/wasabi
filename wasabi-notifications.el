@@ -79,18 +79,26 @@ happens to be on screen."
      ((functionp wasabi-message-notification-function)
       (funcall wasabi-message-notification-function message)))))
 
-(defun wasabi--get-msg-content (target-id chat-buffer)
+(defun wasabi--get-msg-content (target-id &optional chat-buffer)
   "Get the content of the message with TARGET-ID in CHAT-BUFFER.
 
-Returns nil when CHAT-BUFFER is not open: the reacted-to message is
-only known to a rendered chat."
-  (when (and target-id chat-buffer (buffer-live-p chat-buffer))
-    (when-let ((msg (seq-find
-                     (lambda (msg)
-                       (equal (map-elt msg :message-id) target-id))
-                     (map-elt (buffer-local-value 'wasabi-chat--chat chat-buffer)
-                              :messages))))
-      (map-elt msg :content))))
+Without CHAT-BUFFER, every open chat is looked in, so that a
+`wasabi-message-notification-function', which is handed only the
+message, can describe a reaction too.  Returns nil when no open chat
+has it: the reacted-to message is only known to a rendered chat."
+  (when target-id
+    (seq-some
+     (lambda (buffer)
+       (when (and (buffer-live-p buffer)
+                  (or chat-buffer
+                      (eq (buffer-local-value 'major-mode buffer) 'wasabi-chat-mode)))
+         (when-let ((msg (seq-find
+                          (lambda (msg)
+                            (equal (map-elt msg :message-id) target-id))
+                          (map-elt (buffer-local-value 'wasabi-chat--chat buffer)
+                                   :messages))))
+           (map-elt msg :content))))
+     (if chat-buffer (list chat-buffer) (buffer-list)))))
 
 (defun wasabi--reaction-body (message chat-buffer)
   "Describe the reaction in MESSAGE, looking up its target in CHAT-BUFFER."

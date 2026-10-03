@@ -54,6 +54,24 @@
                              (wasabi--notify '((:content . "after")))))
                    '("before" "after")))))
 
+(ert-deftest wasabi-notifications-test-reacted-to-message-found ()
+  (let ((buffer (generate-new-buffer "*wasabi-notifications-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (wasabi-chat-mode)
+            (setq wasabi-chat--chat
+                  (wasabi-chat--make-chat
+                   :chat-jid "447123456789@s.whatsapp.net"
+                   :messages (list (list (cons :message-id "A")
+                                         (cons :content "see you there"))))))
+          ;; Given the chat, as wasabi's own notifiers are.
+          (should (equal (wasabi--get-msg-content "A" buffer) "see you there"))
+          ;; Given only the ID, as a user's notification function is.
+          (should (equal (wasabi--get-msg-content "A") "see you there"))
+          (should-not (wasabi--get-msg-content "nowhere")))
+      (kill-buffer buffer))))
+
 (ert-deftest wasabi-notifications-test-bound-on-the-chat-list ()
   (should (eq (lookup-key wasabi-mode-map (kbd "m"))
               #'wasabi-toggle-notifications)))
