@@ -70,7 +70,10 @@ CHAT-BUFFER is the chat buffer MESSAGE belongs to, when one is open.
 It is optional: a message is worth announcing whether or not its chat
 happens to be on screen."
   (when (and wasabi-notifications-enabled
-             wasabi-message-notification-function)
+             wasabi-message-notification-function
+             ;; A reaction with no emoji is one taken back: nothing to say.
+             (not (and (map-elt message :is-reaction)
+                       (member (map-elt message :emoji) '(nil "")))))
     (cond
      ((eq wasabi-message-notification-function 'notifications)
       (wasabi--notify-with-notifications message chat-buffer))

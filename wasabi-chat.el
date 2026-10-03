@@ -132,9 +132,109 @@ open it at full size."
 
 ;; Parsing functions - convert protocol structures to internal format
 
+(defconst wasabi-chat--wrappers
+  '(associatedChildMessage botInvokeMessage ephemeralMessage viewOnceMessage
+    viewOnceMessageV2 viewOnceMessageV2Extension documentWithCaptionMessage)
+  "Message types that carry another message, under their `message' key.
+A photo in an album arrives as an associatedChildMessage, for one.")
+
+(defun wasabi-chat--unwrap (p-message)
+  "Return the message protocol P-MESSAGE carries, or P-MESSAGE itself."
+  (let ((inner (seq-some (lambda (wrapper)
+                           (map-nested-elt p-message (list wrapper 'message)))
+                         wasabi-chat--wrappers)))
+    (if (consp inner)
+        (wasabi-chat--unwrap inner)
+      p-message)))
+
+(defun wasabi-chat--message-type (p-message)
+  "Return the name of protocol P-MESSAGE's type, as a symbol, or nil.
+That is its first key that is not bookkeeping riding along with it."
+  (seq-find (lambda (key)
+              (not (memq key '(messageContextInfo senderKeyDistributionMessage))))
+            (map-keys p-message)))
+
+(defun wasabi-chat--silent-p (p-message)
+  "Return non-nil when protocol P-MESSAGE is no message to show.
+Bookkeeping, like a change of disappearing-message timer or a group's
+encryption keys going round.  Edits and deletions are taken out before
+this is asked."
+  (memq (wasabi-chat--message-type p-message) '(nil protocolMessage)))
+
+(defun wasabi-chat--map-link (location)
+  "Return a map link for the protocol LOCATION, or nil without one."
+  (let ((latitude (map-elt location 'degreesLatitude))
+        (longitude (map-elt location 'degreesLongitude)))
+    (when (and (numberp latitude) (numberp longitude)
+               (not (and (zerop latitude) (zerop longitude))))
+      (format "https://maps.google.com/?q=%s,%s" latitude longitude))))
+
+(defun wasabi-chat--label (p-message)
+  "Return a line or two describing protocol P-MESSAGE's less common types.
+Text, images, video, documents, audio and stickers are not among them.
+A type not known here at all is named, so it can be told apart."
+  (let* ((type (wasabi-chat--message-type p-message))
+         (body (map-elt p-message type))
+         (text (lambda (value) (and (stringp value) (not (string-empty-p value)) value)))
+         (labelled (lambda (label &optional detail)
+                     (if-let ((detail (funcall text detail)))
+                         (format "[%s: %s]" label detail)
+                       (format "[%s]" label))))
+         (plural (lambda (count noun)
+                   (format "%d %s%s" count noun (if (= count 1) "" "s")))))
+    (pcase type
+      ('albumMessage
+       (let ((images (or (map-elt body 'expectedImageCount) 0))
+             (videos (or (map-elt body 'expectedVideoCount) 0)))
+         (funcall labelled "album"
+                  (string-join (delq nil (list (and (> images 0) (funcall plural images "photo"))
+                                               (and (> videos 0) (funcall plural videos "video"))))
+                               ", "))))
+      ('contactMessage (funcall labelled "contact" (map-elt body 'displayName)))
+      ('contactsArrayMessage
+       (funcall labelled "contacts"
+                (string-join (delq nil (mapcar (lambda (contact)
+                                                 (funcall text (map-elt contact 'displayName)))
+                                               (map-elt body 'contacts)))
+                             ", ")))
+      ((or 'locationMessage 'liveLocationMessage)
+       (string-join (delq nil (list (funcall labelled
+                                             (if (eq type 'liveLocationMessage)
+                                                 "live location"
+                                               "location")
+                                             (or (funcall text (map-elt body 'name))
+                                                 (funcall text (map-elt body 'address))))
+                                    (wasabi-chat--map-link body)))
+                    " "))
+      ((or 'pollCreationMessage 'pollCreationMessageV2 'pollCreationMessageV3)
+       (concat (funcall labelled "poll" (map-elt body 'name))
+               (mapconcat (lambda (option) (concat "\n• " (map-elt option 'optionName)))
+                          (map-elt body 'options) "")))
+      ((or 'pollUpdateMessage 'pollUpdateMessageV2) "[poll vote]")
+      ('eventMessage
+       (concat (funcall labelled (if (map-elt body 'isCanceled) "cancelled event" "event")
+                        (map-elt body 'name))
+               (when-let ((start (wasabi--parse-timestamp (map-elt body 'startTime))))
+                 (format-time-string " %b %-d, %H:%M" start))))
+      ('groupInviteMessage
+       (concat (funcall labelled "group invite" (map-elt body 'groupName))
+               (when-let ((caption (funcall text (map-elt body 'caption))))
+                 (concat "\n" caption))))
+      ('stickerPackMessage (funcall labelled "sticker pack" (map-elt body 'name)))
+      ('templateMessage
+       (funcall labelled "business message"
+                (or (map-nested-elt body '(hydratedTemplate hydratedContentText))
+                    (map-nested-elt body '(Format HydratedFourRowTemplate hydratedContentText)))))
+      ('interactiveMessage
+       (funcall labelled "business message" (map-nested-elt body '(body text))))
+      ;; Text that came with none, as a quote wuzapi kept no text for.
+      ((or 'nil 'conversation 'extendedTextMessage) "[message]")
+      (_ (format "[%s]" type)))))
+
 (defun wasabi-chat--parse-content (p-message)
   "Parse displayable content from protocol P-MESSAGE structure.
 Returns string like \"Hello\" or \"[image]\"."
+  (setq p-message (wasabi-chat--unwrap p-message))
   (cond
    ((map-elt p-message 'conversation)
     (map-elt p-message 'conversation))
@@ -252,9 +352,7 @@ Returns string like \"Hello\" or \"[image]\"."
    ((map-elt p-message 'reactionMessage)
     ;; (message "[reaction]\n\n%s" p-message)
     "[reaction]")
-   (t
-    ;; (message "[unknown]\n\n%s" p-message)
-    "[unknown]")))
+   (t (wasabi-chat--label p-message))))
 
 (cl-defun wasabi-chat--parse-sender-name (p-data p-sender-jid &key contacts contact-name)
   "Parse sender name from P-DATA and P-SENDER-JID.
@@ -294,8 +392,10 @@ REACTIONS is a hash table of message-id -> list of reactions."
           ;; it to learn LID/phone-number pairings for chats we have not
           ;; seen a message in yet.
           (wasabi--learn-from-message-info (map-elt p-data 'Info))
-          ;; Skip reaction messages - they're already in reactions.
-          (unless (map-nested-elt p-data '(Message reactionMessage))
+          ;; Skip reaction messages - they're already in reactions - and
+          ;; bookkeeping that is no message at all.
+          (unless (or (map-nested-elt p-data '(Message reactionMessage))
+                      (wasabi-chat--silent-p (map-elt p-data 'Message)))
             (let* ((p-sender-jid (map-nested-elt p-data '(Info Sender)))
                    (p-sender-name (wasabi-chat--parse-sender-name p-data p-sender-jid
                                                                   :contacts contacts
@@ -332,7 +432,9 @@ REACTIONS is a hash table of message-id -> list of reactions."
 CONTACT-NAME is the chat's display name, CHAT-JID its JID, and CONTACTS
 the internal contacts alist used to resolve the sender.
 Returns alist with :sender-name, :timestamp and :content.
-For reaction messages, also includes :is-reaction, :target-id and :emoji."
+For reaction messages, also includes :is-reaction, :target-id and :emoji.
+Returns nil for bookkeeping that is no message; see `wasabi-chat--silent-p'."
+  (unless (wasabi-chat--silent-p p-message)
   (let* ((is-from-me (map-elt p-info 'IsFromMe))
          (sender-jid (map-elt p-info 'Sender))
          (push-name (map-elt p-info 'PushName))
@@ -363,7 +465,7 @@ For reaction messages, also includes :is-reaction, :target-id and :emoji."
         (:from-me . ,(and is-from-me t))
         (:sender-jid . ,(wasabi--jid-string sender-jid))
         (:chat-jid . ,(or (wasabi--jid-string (map-elt p-info 'Chat)) chat-jid))
-        (:quote . ,(wasabi-chat--quote p-message))))))
+        (:quote . ,(wasabi-chat--quote p-message)))))))
 
 (defun wasabi-chat--receipt-fields (p-message chat-jid)
   "Return what a read receipt for the stored P-MESSAGE needs to know.
@@ -484,7 +586,8 @@ on the chat, and history is the only place to learn the latter.")
 
 (defun wasabi-chat--summarize (p-message)
   "Return a one-line summary of protocol P-MESSAGE, for a quote."
-  (let* ((labelled (lambda (label text)
+  (let* ((p-message (wasabi-chat--unwrap p-message))
+         (labelled (lambda (label text)
                      (if (and (stringp text) (not (string-empty-p text)))
                          (concat label " " text)
                        label)))
@@ -506,7 +609,7 @@ on the chat, and history is the only place to learn the latter.")
             (funcall labelled "[document]"
                      (or (map-nested-elt p-message '(documentMessage title))
                          (map-nested-elt p-message '(documentMessage fileName)))))
-           (t "[message]"))))
+           (t (wasabi-chat--label p-message)))))
     (truncate-string-to-width (replace-regexp-in-string "[\n\r]+" " " summary)
                               80 nil nil "…")))
 
@@ -682,7 +785,8 @@ The next message sent goes out as the reply.  Cancel with
   "Parse reactions from P-MESSAGES and return a hash map of message-id -> reactions.
 Each reaction is an alist with :emoji and :sender keys.
 CONTACTS is used to resolve sender names."
-  (let ((reactions (make-hash-table :test 'equal)))
+  (let ((reactions (make-hash-table :test 'equal))
+        (found '()))
     (dolist (p-msg (append p-messages nil))
       (when-let* ((data-json (map-elt p-msg 'data_json))
                   ((not (string-empty-p data-json)))
@@ -694,11 +798,33 @@ CONTACTS is used to resolve sender names."
                   (p-sender-jid (map-nested-elt p-data '(Info Sender)))
                   (p-sender-name (wasabi-chat--parse-sender-name p-data p-sender-jid
                                                                  :contacts contacts)))
-        (map-put! reactions p-target-id
-                  (cons `((:emoji . ,(map-nested-elt p-data '(Message reactionMessage text)))
-                          (:sender . ,p-sender-name))
-                        (map-elt reactions p-target-id)))))
+        (push (list (map-nested-elt p-data '(Info Timestamp))
+                    p-target-id
+                    (map-nested-elt p-data '(Message reactionMessage text))
+                    p-sender-name)
+              found)))
+    ;; Oldest first, as they were made: each person has one reaction to a
+    ;; message, so a later one replaces theirs, and an empty one takes it
+    ;; back.  Kept newest first, as the callers expect.
+    (dolist (reaction (sort found (lambda (a b)
+                                    (wasabi--timestamp-older-p (car a) (car b)))))
+      (pcase-let ((`(,_time ,target ,emoji ,sender) reaction))
+        (map-put! reactions target
+                  (wasabi-chat--react (map-elt reactions target) emoji sender t))))
     reactions))
+
+(defun wasabi-chat--react (reactions emoji sender &optional newest-first)
+  "Return REACTIONS with SENDER's reaction now EMOJI.
+It replaces any SENDER had; an empty EMOJI takes theirs back.  REACTIONS
+are in the order they were made, or NEWEST-FIRST."
+  (let ((others (seq-remove (lambda (reaction)
+                              (equal (map-elt reaction :sender) sender))
+                            reactions))
+        (new (when (and (stringp emoji) (not (string-empty-p emoji)))
+               (list (list (cons :emoji emoji) (cons :sender sender))))))
+    (if newest-first
+        (append new others)
+      (append others new))))
 
 (cl-defun wasabi-chat--parse-messages (p-messages &key chat-jid contact-name contacts)
   "Parse array of protocol messages into list of internal display messages.
@@ -2210,8 +2336,8 @@ Finds the message in :messages, updates it, and re-renders just that message."
                                       target-id
                                       (lambda (msg id) (string= (map-elt msg :message-id) id))))
             (target-msg (nth target-idx (map-elt wasabi-chat--chat :messages)))
-            (updated-msg (cons `(:reactions . ,(append (map-elt target-msg :reactions)
-                                                       (list `((:emoji . ,emoji) (:sender . ,sender)))))
+            (updated-msg (cons `(:reactions . ,(wasabi-chat--react (map-elt target-msg :reactions)
+                                                                   emoji sender))
                                (assq-delete-all :reactions (copy-alist target-msg))))
             (updated-messages (append (seq-take (map-elt wasabi-chat--chat :messages) target-idx)
                                       (list updated-msg)

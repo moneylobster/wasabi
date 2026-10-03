@@ -202,7 +202,8 @@
                  "[document]"))
   (should (equal (wasabi-chat--parse-content '((reactionMessage . ((text . "x")))))
                  "[reaction]"))
-  (should (equal (wasabi-chat--parse-content '((somethingElse . t))) "[unknown]")))
+  ;; One not known at all says what it is.
+  (should (equal (wasabi-chat--parse-content '((somethingElse . t))) "[somethingElse]")))
 
 ;;; Image type detection
 
