@@ -141,7 +141,7 @@ Returns string like \"Hello\" or \"[image]\"."
                                         :corner-radius 6
                                         :padding-top 5
                                         :padding-bottom 5))
-                         "[image]")))
+                         (copy-sequence "[image]"))))
       ;; Store metadata as text properties
       (add-text-properties 0 (length image-text)
                            `(image-url ,(map-nested-elt p-message '(imageMessage URL))
@@ -178,7 +178,7 @@ Returns string like \"Hello\" or \"[image]\"."
                                         :padding-top 5
                                         :padding-bottom 5
                                         :is-video t))
-                         "[video]")))
+                         (copy-sequence "[video]"))))
       ;; Store metadata as text properties
       (add-text-properties 0 (length video-text)
                            `(video-url ,(map-nested-elt p-message '(videoMessage URL))
@@ -215,7 +215,10 @@ Returns string like \"Hello\" or \"[image]\"."
                      (wasabi-chat--sticker-cache-file file-sha256 mimetype)))
            (sticker-text (if preview
                              (propertize "[sticker]" 'display preview)
-                           "[sticker]")))
+                           ;; A fresh string: properties are added to it
+                           ;; below, and a literal would be shared by every
+                           ;; sticker still to be fetched.
+                           (copy-sequence "[sticker]"))))
       ;; Store metadata as text properties
       (add-text-properties 0 (length sticker-text)
                            `(sticker-url ,(map-nested-elt p-message '(stickerMessage URL))

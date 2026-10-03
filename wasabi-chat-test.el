@@ -51,6 +51,21 @@
     (should (equal (get-text-property 0 'sticker-width content) 512))
     (should (equal (get-text-property 0 'sticker-height content) 512))))
 
+(ert-deftest wasabi-chat-test-stickers-keep-their-own-metadata ()
+  ;; Several stickers not fetched yet, parsed before any is drawn, as a
+  ;; chat's history is: each must still say which sticker it is.
+  (let* ((wasabi-data-dir (make-temp-file "wasabi-test" t))
+         (first (wasabi-chat--parse-content
+                 (wasabi-chat-test--sticker-message
+                  '(fileSHA256 . "Zmlyc3Q=") '(URL . "https://first"))))
+         (second (wasabi-chat--parse-content
+                  (wasabi-chat-test--sticker-message
+                   '(fileSHA256 . "c2Vjb25k") '(URL . "https://second")))))
+    (should-not (eq first second))
+    (should (equal (get-text-property 0 'sticker-file-sha256 first) "Zmlyc3Q="))
+    (should (equal (get-text-property 0 'sticker-url first) "https://first"))
+    (should (equal (get-text-property 0 'sticker-file-sha256 second) "c2Vjb25k"))))
+
 (ert-deftest wasabi-chat-test-sticker-is-actionable ()
   (let ((content (wasabi-chat--parse-content
                   (wasabi-chat-test--sticker-message))))
