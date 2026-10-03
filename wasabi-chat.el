@@ -94,12 +94,14 @@ Keys:
         (cons (cons key value)
               (assq-delete-all key wasabi-chat--chat))))
 
-(defcustom wasabi-chat-animate-stickers t
-  "Non-nil to play animated stickers in chats, as WhatsApp does.
+(defcustom wasabi-chat-animate-stickers 10
+  "Seconds to play an animated sticker for, or nil to keep them still.
 
-They play only while their chat is in a window, and pause when it is
-not.  Toggle it with `wasabi-chat-toggle-sticker-animation'."
-  :type 'boolean
+Each plays when its chat opens, or when it arrives, and then holds
+still: a short burst rather than a chat full of animation playing all
+the while.  Toggle it with `wasabi-chat-toggle-sticker-animation'."
+  :type '(choice (const :tag "Still" nil)
+                 (number :tag "Seconds"))
   :group 'wasabi)
 
 (defcustom wasabi-chat-sticker-size 90
@@ -1282,8 +1284,10 @@ Shows different bindings depending on whether point is in input area."
 \\{wasabi-chat-mode-map}"
   (setq-local inhibit-read-only nil)
   (add-hook 'post-command-hook #'wasabi-chat--update-header-line nil t)
-  ;; Globally, as only the global hook hears of a buffer leaving a window.
-  (add-hook 'window-buffer-change-functions #'wasabi-chat--sync-animations)
+  ;; Stickers once paused and resumed as their chat left and came back
+  ;; into view, which slowed them to a crawl; a session still running
+  ;; that code has this to undo.
+  (remove-hook 'window-buffer-change-functions #'wasabi-chat--sync-animations)
   (wasabi-chat--update-header-line))
 
 (defun wasabi-chat--in-input-area-p ()
@@ -2517,26 +2521,33 @@ same sticker are two, as each needs its own animation."
                      (wasabi-chat--sticker-regions)))
    #'eq))
 
-(defun wasabi-chat--animate-stickers ()
-  "Play this chat's animated stickers if it is on screen, else pause them.
+(defvar-local wasabi-chat--stickers-played nil
+  "The sticker images in this chat that have had their turn to play.")
 
-Emacs keeps an animation going for as long as its buffer lives, seen or
-not, so a chat out of sight is stopped here rather than left to run."
+(defun wasabi-chat--animate-stickers ()
+  "Play the animated stickers newly drawn in this chat, for a while.
+
+Each plays once, for `wasabi-chat-animate-stickers' seconds, from its
+first frame: when the chat opens, which draws them all afresh, or when
+it arrives.  Drawing the chat again for anything else leaves the ones
+that have played alone."
   (when (derived-mode-p 'wasabi-chat-mode)
-    (let ((play (and wasabi-chat-animate-stickers
-                     (get-buffer-window (current-buffer) t)))
-          (images (wasabi-chat--sticker-images)))
-      ;; Paused, or drawn over since: a redraw puts a new image in place
-      ;; and would leave the old one playing where nobody sees it.
+    (let ((images (wasabi-chat--sticker-images))
+          (played (or wasabi-chat--stickers-played
+                      (setq wasabi-chat--stickers-played
+                            (make-hash-table :test 'eq :weakness 'key)))))
+      ;; Turned off, or drawn over since: a redraw puts a new image in
+      ;; place and would leave the old one playing where nobody sees it.
       (dolist (timer (wasabi-chat--animation-timers))
-        (unless (and play (memq (car (timer--args timer)) images))
+        (unless (and wasabi-chat-animate-stickers
+                     (memq (car (timer--args timer)) images))
           (cancel-timer timer)))
-      (when play
+      (when (numberp wasabi-chat-animate-stickers)
         (dolist (image images)
-          (when (and (not (image-animate-timer image))
-                     (ignore-errors (image-multi-frame-p image)))
-            ;; From the frame it was paused on.
-            (image-animate image (or (image-current-frame image) 0) t)))))))
+          (unless (gethash image played)
+            (puthash image t played)
+            (when (ignore-errors (image-multi-frame-p image))
+              (image-animate image 0 wasabi-chat-animate-stickers))))))))
 
 (defun wasabi-chat--animation-timers ()
   "Return the timers playing images that were started in this buffer."
@@ -2548,20 +2559,30 @@ not, so a chat out of sight is stopped here rather than left to run."
               timer-list))
 
 (defun wasabi-chat--sync-animations (&optional _frame)
-  "Play the stickers of chats on screen, and pause the rest.
-For `window-buffer-change-functions'."
+  "Bring every chat's stickers in line with `wasabi-chat-animate-stickers'."
   (dolist (buffer (buffer-list))
     (when (eq (buffer-local-value 'major-mode buffer) 'wasabi-chat-mode)
       (with-current-buffer buffer
         (wasabi-chat--animate-stickers)))))
 
-(defun wasabi-chat-toggle-sticker-animation ()
-  "Play animated stickers, or hold them still.
+(defvar wasabi-chat--animate-seconds 10
+  "How long stickers play for once turned back on.")
 
-Lasts for this session.  Customize `wasabi-chat-animate-stickers' to
-change what wasabi starts with."
+(defun wasabi-chat-toggle-sticker-animation ()
+  "Hold animated stickers still, or play them again.
+
+Turned on, every chat's stickers play once more.  Lasts for this
+session.  Customize `wasabi-chat-animate-stickers' to change what wasabi
+starts with."
   (interactive)
-  (setq wasabi-chat-animate-stickers (not wasabi-chat-animate-stickers))
+  (if wasabi-chat-animate-stickers
+      (setq wasabi-chat--animate-seconds wasabi-chat-animate-stickers
+            wasabi-chat-animate-stickers nil)
+    (setq wasabi-chat-animate-stickers wasabi-chat--animate-seconds)
+    (dolist (buffer (buffer-list))
+      (when (eq (buffer-local-value 'major-mode buffer) 'wasabi-chat-mode)
+        (with-current-buffer buffer
+          (setq wasabi-chat--stickers-played nil)))))
   (wasabi-chat--sync-animations)
   (message "Wasabi sticker animation %s"
            (if wasabi-chat-animate-stickers "on" "off")))

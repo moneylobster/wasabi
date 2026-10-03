@@ -7,9 +7,8 @@
 ;;   emacs -Q --batch -L . -L <acp-dir> -l wasabi-sticker-animation-test.el \
 ;;         -f ert-run-tests-batch-and-exit
 ;;
-;; Batch Emacs cannot decode images, so whether one has frames, and
-;; whether the chat is in a window, are stubbed.  The animation timers
-;; are Emacs's own.
+;; Batch Emacs cannot decode images, so whether one has frames is
+;; stubbed.  The animation timers are Emacs's own.
 
 ;;; Code:
 
@@ -29,17 +28,13 @@
 
 (defmacro wasabi-sticker-animation-test--with (images &rest body)
   "Run BODY in a chat showing stickers IMAGES.
-In BODY, setting `shown' decides whether the chat is in a window, and
-`animated' lists the images that have frames."
+In BODY, `animated' lists the images that have frames."
   (declare (indent 1))
   `(let ((buffer (generate-new-buffer "*wasabi-animation-test*"))
-         (wasabi-chat-animate-stickers t)
-         (shown t)
+         (wasabi-chat-animate-stickers 10)
          (animated ,images))
      (unwind-protect
-         (cl-letf (((symbol-function 'get-buffer-window)
-                    (lambda (&rest _) (and shown 'window)))
-                   ((symbol-function 'image-multi-frame-p)
+         (cl-letf (((symbol-function 'image-multi-frame-p)
                     (lambda (image) (and (memq image animated) '(4 . 0.1)))))
            (with-current-buffer buffer
              (wasabi-chat-mode)
@@ -55,17 +50,43 @@ In BODY, setting `shown' decides whether the chat is in a window, and
   (mapcar (lambda (timer) (car (timer--args timer)))
           (wasabi-chat--animation-timers)))
 
-(ert-deftest wasabi-sticker-animation-test-plays-when-shown ()
+(defun wasabi-sticker-animation-test--stop-all ()
+  "Stop this buffer's animations, as their time running out would."
+  (mapc #'cancel-timer (wasabi-chat--animation-timers)))
+
+(ert-deftest wasabi-sticker-animation-test-plays-for-a-while ()
   (let ((a (wasabi-sticker-animation-test--image "a"))
         (b (wasabi-sticker-animation-test--image "b")))
     (wasabi-sticker-animation-test--with (list a b)
       (wasabi-chat--animate-stickers)
       (should (equal (length (wasabi-sticker-animation-test--playing)) 2))
-      ;; Looping for good, not played once through.
-      (should (eq (nth 4 (timer--args (image-animate-timer a))) t))
-      ;; Asked again, nothing doubles up.
+      ;; From its first frame, for the seconds set, not for good.
+      (let ((args (timer--args (image-animate-timer a))))
+        (should (equal (nth 1 args) 0))
+        (should (equal (nth 4 args) 10))))))
+
+(ert-deftest wasabi-sticker-animation-test-plays-once ()
+  (let ((a (wasabi-sticker-animation-test--image "a")))
+    (wasabi-sticker-animation-test--with (list a)
       (wasabi-chat--animate-stickers)
-      (should (equal (length (wasabi-sticker-animation-test--playing)) 2)))))
+      (wasabi-sticker-animation-test--stop-all)
+      ;; The chat drawn again, say for a new message: it has had its turn.
+      (wasabi-chat--animate-stickers)
+      (should-not (wasabi-sticker-animation-test--playing)))))
+
+(ert-deftest wasabi-sticker-animation-test-new-ones-play ()
+  (let ((a (wasabi-sticker-animation-test--image "a"))
+        (b (wasabi-sticker-animation-test--image "b")))
+    (wasabi-sticker-animation-test--with (list a)
+      (wasabi-chat--animate-stickers)
+      (wasabi-sticker-animation-test--stop-all)
+      ;; A sticker arriving plays; the one before it does not again.
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (wasabi-sticker-animation-test--insert b))
+      (setq animated (list a b))
+      (wasabi-chat--animate-stickers)
+      (should (equal (wasabi-sticker-animation-test--playing) (list b))))))
 
 (ert-deftest wasabi-sticker-animation-test-same-sticker-twice ()
   ;; Sent twice, and drawn as two images that are `equal' but not `eq':
@@ -75,20 +96,6 @@ In BODY, setting `shown' decides whether the chat is in a window, and
     (wasabi-sticker-animation-test--with (list first again)
       (wasabi-chat--animate-stickers)
       (should (equal (length (wasabi-sticker-animation-test--playing)) 2)))))
-
-(ert-deftest wasabi-sticker-animation-test-pauses-out-of-sight ()
-  (let ((a (wasabi-sticker-animation-test--image "a")))
-    (wasabi-sticker-animation-test--with (list a)
-      (setq shown nil)
-      (wasabi-chat--animate-stickers)
-      (should-not (wasabi-sticker-animation-test--playing))
-      (setq shown t)
-      (wasabi-chat--sync-animations)
-      (should (equal (wasabi-sticker-animation-test--playing) (list a)))
-      ;; Buried: the window change pauses it.
-      (setq shown nil)
-      (wasabi-chat--sync-animations)
-      (should-not (wasabi-sticker-animation-test--playing)))))
 
 (ert-deftest wasabi-sticker-animation-test-stills-stay-still ()
   (let ((a (wasabi-sticker-animation-test--image "a"))
@@ -104,13 +111,12 @@ In BODY, setting `shown' decides whether the chat is in a window, and
     (wasabi-sticker-animation-test--with (list old)
       (wasabi-chat--animate-stickers)
       (should (equal (length (wasabi-sticker-animation-test--playing)) 1))
-      ;; The same sticker drawn again, as a new image.
+      ;; The same sticker drawn again, as a new image, which plays afresh.
       (let ((inhibit-read-only t))
         (put-text-property (point-min) (+ (point-min) 9) 'display new))
       (setq animated (list old new))
       (wasabi-chat--animate-stickers)
-      (should (equal (length (wasabi-sticker-animation-test--playing)) 1))
-      (should (eq (car (wasabi-sticker-animation-test--playing)) new)))))
+      (should (equal (wasabi-sticker-animation-test--playing) (list new))))))
 
 (ert-deftest wasabi-sticker-animation-test-toggle ()
   (let ((a (wasabi-sticker-animation-test--image "a")))
@@ -120,14 +126,25 @@ In BODY, setting `shown' decides whether the chat is in a window, and
       (wasabi-chat-toggle-sticker-animation)
       (should-not wasabi-chat-animate-stickers)
       (should-not (wasabi-sticker-animation-test--playing))
+      ;; Back on: they play again, for as long as before.
       (wasabi-chat-toggle-sticker-animation)
-      (should (wasabi-sticker-animation-test--playing)))))
+      (should (equal wasabi-chat-animate-stickers 10))
+      (should (equal (wasabi-sticker-animation-test--playing) (list a))))))
 
-(ert-deftest wasabi-sticker-animation-test-hooked-on-window-changes ()
+(ert-deftest wasabi-sticker-animation-test-off-from-the-start ()
+  (let ((a (wasabi-sticker-animation-test--image "a")))
+    (wasabi-sticker-animation-test--with (list a)
+      (setq wasabi-chat-animate-stickers nil)
+      (wasabi-chat--animate-stickers)
+      (should-not (wasabi-sticker-animation-test--playing)))))
+
+(ert-deftest wasabi-sticker-animation-test-not-on-window-changes ()
+  ;; Resuming on a chat's return to view is what slowed them to a crawl.
+  (add-hook 'window-buffer-change-functions #'wasabi-chat--sync-animations)
   (with-temp-buffer
     (wasabi-chat-mode)
-    (should (memq #'wasabi-chat--sync-animations
-                  (default-value 'window-buffer-change-functions)))))
+    (should-not (memq #'wasabi-chat--sync-animations
+                      (default-value 'window-buffer-change-functions)))))
 
 (provide 'wasabi-sticker-animation-test)
 ;;; wasabi-sticker-animation-test.el ends here
