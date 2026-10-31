@@ -64,6 +64,7 @@
 (declare-function wasabi--reparse-chat-index "wasabi")
 (declare-function wasabi--send-chat-index-request "wasabi")
 (declare-function wasabi--save-jid-aliases "wasabi")
+(declare-function wasabi--save-jid-aliases-soon "wasabi")
 (declare-function wasabi--same-chat-p "wasabi")
 (declare-function wasabi--timestamp-older-p "wasabi")
 (declare-function wasabi-data-dir "wasabi")
@@ -88,6 +89,18 @@ Keys:
 (defvar-local wasabi-chat--input-start-marker nil
   "Marker for the start of user input.")
 
+(defvar-local wasabi-chat--render-pending nil
+  "Messages still waiting to be drawn in this buffer, or nil.")
+
+(defvar-local wasabi-chat--render-day nil
+  "The day of the last message drawn while rendering.")
+
+(defvar-local wasabi-chat--render-latest-own-id nil
+  "The latest message we sent, as of the render being drawn.")
+
+(defvar-local wasabi-chat--render-timer nil
+  "Timer drawing the rest of this buffer's messages, if any.")
+
 (defun wasabi-chat--update-chat (key value)
   "Update KEY in wasabi-chat--chat with VALUE, preserving other keys."
   (setq wasabi-chat--chat
@@ -110,6 +123,15 @@ the while.  Toggle it with `wasabi-chat-toggle-sticker-animation'."
 Stickers are the message rather than an attachment to it, so they
 render larger than image and video thumbnails do.  Press RET on one to
 open it at full size."
+  :type 'natnum
+  :group 'wasabi)
+
+(defcustom wasabi-chat-render-chunk-size 100
+  "How many messages to draw before letting Emacs handle input.
+
+A chat can hold a thousand messages, each with a thumbnail to decode,
+and drawing them all in one go froze Emacs until it was done.  Drawing
+a chunk at a time leaves it answering while the rest are drawn."
   :type 'natnum
   :group 'wasabi)
 
@@ -847,8 +869,9 @@ Messages with reactions will have a :reactions field."
                                              (wasabi-chat--reply-fields p-msg)))))
                                (append p-messages nil)))))
     ;; Parsing learns JID pairings from each message's Info; persist
-    ;; whatever this batch turned up, in one go.
-    (wasabi--save-jid-aliases)
+    ;; whatever this batch turned up, in one go, once the burst of
+    ;; histories WhatsApp is sending has stopped.
+    (wasabi--save-jid-aliases-soon)
     (wasabi-chat--save-changes)
     (wasabi-chat--attach-changes
      (sort parsed
@@ -1256,6 +1279,8 @@ many, with who and when on hover."
 (defun wasabi-chat--rerender-message (message)
   "Draw MESSAGE again in place, keeping the rest of the chat as it is.
 Unlike a refresh, this leaves whatever is being typed alone."
+  ;; A message still waiting to be drawn has no place in the buffer yet.
+  (wasabi-chat--flush-pending-render)
   (let ((inhibit-read-only t)
         (id (map-elt message :message-id)))
     (save-excursion
@@ -1414,6 +1439,7 @@ Shows different bindings depending on whether point is in input area."
   ;; into view, which slowed them to a crawl; a session still running
   ;; that code has this to undo.
   (remove-hook 'window-buffer-change-functions #'wasabi-chat--sync-animations)
+  (add-hook 'kill-buffer-hook #'wasabi-chat--cancel-render nil t)
   (wasabi-chat--update-header-line))
 
 (defun wasabi-chat--in-input-area-p ()
@@ -2119,6 +2145,7 @@ If in input area, move to just before the prompt."
 MESSAGES is a list of already-parsed internal message alists."
   (unless (derived-mode-p 'wasabi-chat-mode)
     (error "Not in a chat buffer"))
+  (wasabi-chat--cancel-render)
   (map-put! wasabi-chat--chat :messages messages)
   (map-put! wasabi-chat--chat
             :max-sender-width (wasabi-chat--calculate-max-sender-width messages))
@@ -2234,23 +2261,101 @@ RECEIPT, when given, is a line under it saying whether it was read."
 
 (defun wasabi-chat--render-messages (messages)
   "Render internal format MESSAGES to current buffer.
-MESSAGES is a list of alists with :sender-name, :timestamp, :content."
+MESSAGES is a list of alists with :sender-name, :timestamp, :content.
+
+Long chats are drawn a chunk at a time, so Emacs keeps answering while
+the rest are drawn."
   (let* ((latest-own-id (wasabi-chat--latest-own-id messages))
-         (message-lines
-          (mapcar
-           (lambda (msg)
-             (wasabi-chat--render msg :latest-own-id latest-own-id))
-           messages)))
-    (let ((start (point))
-          (day nil))
-      (insert "\n")
-      (seq-mapn (lambda (message line)
-                  (when-let ((heading (wasabi-chat--day-heading message day)))
-                    (insert heading)
-                    (setq day (wasabi-chat--day message)))
-                  (insert line))
-                messages message-lines)
-      (put-text-property start (point) 'read-only t))))
+         (start (point)))
+    (insert "\n")
+    (setq wasabi-chat--render-latest-own-id latest-own-id
+          wasabi-chat--render-day nil)
+    (let ((result (wasabi-chat--render-chunk messages latest-own-id nil)))
+      (setq wasabi-chat--render-day (cdr result)
+            wasabi-chat--render-pending (car result)))
+    (put-text-property start (point) 'read-only t)
+    (when wasabi-chat--render-pending
+      (wasabi-chat--schedule-render))))
+
+(defun wasabi-chat--render-chunk (messages latest-own-id day)
+  "Draw up to `wasabi-chat--render-chunk-size' of MESSAGES.
+
+LATEST-OWN-ID is the last message we sent, and DAY the day of the last
+message drawn.  Return (REST . DAY), REST being what is left to draw."
+  (let ((rest messages)
+        (left (max 1 wasabi-chat-render-chunk-size)))
+    (while (and rest (> left 0))
+      (let ((message (car rest)))
+        (when-let ((heading (wasabi-chat--day-heading message day)))
+          (insert heading)
+          (setq day (wasabi-chat--day message)))
+        (insert (wasabi-chat--render message :latest-own-id latest-own-id))
+        (setq rest (cdr rest)
+              left (1- left))))
+    (cons rest day)))
+
+(defun wasabi-chat--schedule-render ()
+  "Arrange to draw the next chunk of this chat's messages."
+  (let ((buffer (current-buffer)))
+    (setq wasabi-chat--render-timer
+          (run-at-time 0.01 nil
+                       (lambda ()
+                         (when (buffer-live-p buffer)
+                           (with-current-buffer buffer
+                             (setq wasabi-chat--render-timer nil)
+                             (wasabi-chat--render-step t))))))))
+
+(defun wasabi-chat--cancel-render-timer ()
+  "Cancel the timer drawing this chat, keeping what is pending."
+  (when (timerp wasabi-chat--render-timer)
+    (cancel-timer wasabi-chat--render-timer))
+  (setq wasabi-chat--render-timer nil))
+
+(defun wasabi-chat--cancel-render ()
+  "Stop drawing this chat and forget the messages still waiting."
+  (wasabi-chat--cancel-render-timer)
+  (setq wasabi-chat--render-pending nil))
+
+(defun wasabi-chat--flush-pending-render ()
+  "Draw the messages still waiting to be drawn, now."
+  (when wasabi-chat--render-pending
+    (wasabi-chat--cancel-render-timer)
+    (while wasabi-chat--render-pending
+      (wasabi-chat--render-step))))
+
+(defun wasabi-chat--render-step (&optional schedule)
+  "Draw the next chunk of this chat's messages.
+With SCHEDULE, arrange for the chunk after it too."
+  (when (and (derived-mode-p 'wasabi-chat-mode)
+             wasabi-chat--render-pending)
+    (let* ((in-prompt (and wasabi-chat--prompt-marker
+                           (>= (point) wasabi-chat--prompt-marker)))
+           (point-marker (unless in-prompt (copy-marker (point))))
+           (saved-input (when wasabi-chat--prompt-marker
+                          (wasabi-chat--get-prompt-input)))
+           (inhibit-read-only t))
+      (when wasabi-chat--prompt-marker
+        (delete-region wasabi-chat--prompt-marker (point-max)))
+      (goto-char (point-max))
+      (let ((start (point))
+            (result (wasabi-chat--render-chunk
+                     wasabi-chat--render-pending
+                     wasabi-chat--render-latest-own-id
+                     wasabi-chat--render-day)))
+        (put-text-property start (point) 'read-only t)
+        (setq wasabi-chat--render-day (cdr result)
+              wasabi-chat--render-pending (car result)))
+      (wasabi-chat--setup-prompt)
+      (when (and saved-input (not (string-empty-p saved-input)))
+        (goto-char (point-max))
+        (insert saved-input))
+      (unless in-prompt
+        (goto-char point-marker))
+      (when point-marker
+        (set-marker point-marker nil))
+      (wasabi-chat--load-stickers)
+      (when (and schedule wasabi-chat--render-pending)
+        (wasabi-chat--schedule-render)))))
 
 (defun wasabi-chat--day (message)
   "Return the day MESSAGE was sent, as YYYY-MM-DD, or nil if unknown."
@@ -2281,6 +2386,8 @@ Updates :messages list and :max-sender-width in chat state."
     (error "Not in a chat buffer"))
   (unless message
     (error "message is required"))
+  ;; Draw what is still waiting first, so this message lands after it.
+  (wasabi-chat--flush-pending-render)
   (let ((inhibit-read-only t)
         (saved-input nil))
     (when wasabi-chat--prompt-marker

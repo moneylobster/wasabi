@@ -111,6 +111,23 @@ without another batch arriving."
   :type 'natnum
   :group 'wasabi)
 
+(defcustom wasabi-refresh-delay 0.5
+  "Seconds to wait before redrawing the chats list after an update.
+
+Messages and histories arrive in bursts, and drawing the list once per
+arrival kept Emacs busy drawing rather than answering.  A burst is
+drawn once instead, as elfeed does with its search buffer."
+  :type 'number
+  :group 'wasabi)
+
+(defcustom wasabi-index-refresh-delay 1.0
+  "Seconds of quiet before the chat index is fetched again.
+
+Every incoming message used to fetch the index, so a sync meant a
+fetch per message, each one ending in a redraw of the chats list."
+  :type 'number
+  :group 'wasabi)
+
 (defcustom wasabi-send-read-receipts t
   "Non-nil to tell senders when you have read their messages.
 
@@ -219,6 +236,15 @@ wuzapi's message rows record anything but when they were written.")
 
 (defvar wasabi--jid-aliases-dirty nil
   "Non-nil when learned JID pairings have yet to be written to disk.")
+
+(defvar wasabi--aliases-save-timer nil
+  "Idle timer writing learned JID aliases once a burst is over.")
+
+(defvar wasabi--refresh-timer nil
+  "Timer redrawing the chats list once a burst of updates is over.")
+
+(defvar wasabi--index-refresh-timer nil
+  "Timer fetching the chat index once messages stop arriving.")
 
 (defun wasabi--jid-string (jid)
   "Return JID as a non-empty string, or nil.
@@ -391,6 +417,18 @@ Callers save once per batch of learning rather than per pairing."
                            :push-names push-names
                            :chat-times chat-times)
                      (current-buffer)))))))))
+
+(defun wasabi--save-jid-aliases-soon ()
+  "Write learned JID aliases once the current burst is over.
+
+A message arriving while WhatsApp syncs used to rewrite the whole
+cache, which is large once there are many chats."
+  (unless wasabi--aliases-save-timer
+    (setq wasabi--aliases-save-timer
+          (run-with-idle-timer 2 nil
+                               (lambda ()
+                                 (setq wasabi--aliases-save-timer nil)
+                                 (wasabi--save-jid-aliases))))))
 
 (defun wasabi--load-jid-aliases ()
   "Load what we had learned about who is who from disk."
@@ -568,6 +606,17 @@ name we saved for them."
                    (mapcar (lambda (variant)
                              (map-elt contacts (intern variant)))
                            (wasabi--jid-variants jid))))))))
+
+(defun wasabi--contacts-table (contacts)
+  "Return CONTACTS as a hash table, unless it already is one.
+
+`map-elt' scans an alist for each lookup, so naming every chat in the
+index once meant scanning the whole contact list per chat."
+  (if (or (null contacts) (hash-table-p contacts))
+      contacts
+    (let ((table (make-hash-table :test 'equal)))
+      (dolist (entry contacts table)
+        (puthash (car entry) (cdr entry) table)))))
 
 (defun wasabi--push-name (push-name)
   "Return PUSH-NAME marked as a push name, or nil if there is none.
@@ -1352,12 +1401,15 @@ Calls ON-FAILURE with error if download fails."
                                ;; anything routes on the JID, or the message lands
                                ;; in a duplicate chat instead of the open one.
                                (wasabi--learn-from-message-info p-info)
-                               (wasabi--save-jid-aliases)
+                               ;; Both are deferred: a sync delivers
+                               ;; messages in bursts, and doing either per
+                               ;; message kept Emacs from answering.
+                               (wasabi--save-jid-aliases-soon)
                                (wasabi--remember-chat-time
                                 chat-jid (map-elt p-info 'Timestamp))
-                               ;; Trigger re-fetching index to show recent
-                               ;; chats and groups with latest order.
-                               (wasabi--send-chat-history-request :chat-jid "index")
+                               ;; Refetch the index once messages stop, to
+                               ;; show recent chats with their latest order.
+                               (wasabi--schedule-chat-index-refresh)
                                (if-let ((change (wasabi-chat--change p-message p-info)))
                                    ;; An edit or a deletion of an earlier message, rather
                                    ;; than a message of its own: annotate that one.
@@ -1656,8 +1708,13 @@ Optional SILENT suppresses visual messaging during status change."
   (if (eq type 'ready)
       (wasabi--update-header-line)
     (setq header-line-format nil))
-  (when (or (eq type 'ready) (not silent))
-    (wasabi--refresh)))
+  (cond
+   ;; A background sync says it is ready again every time a batch lands;
+   ;; draw the list once the burst is over rather than once per batch.
+   ((and (eq type 'ready) silent)
+    (wasabi--refresh-soon))
+   ((or (eq type 'ready) (not silent))
+    (wasabi--refresh))))
 
 (defun wasabi--timezone ()
   "Return the current time zone."
@@ -2095,20 +2152,26 @@ tell one September 22 from another.  SHORT abbreviates the month."
 (defun wasabi--group-chats-by-date (chats-index)
   "Group CHATS-INDEX by date labels (Today, Yesterday, or date).
 Returns list of (date-label . chats-for-that-date)."
-  (let ((date-groups '()))
+  ;; Chats are collected at the front of their group and reversed at the
+  ;; end: appending to the tail once per chat made this quadratic.
+  (let ((date-groups '())
+        (groups (make-hash-table :test 'equal)))
     (dolist (chat chats-index)
       (let* ((timestamp (wasabi--parse-timestamp (map-elt chat :last-updated)))
              (date-label (if timestamp
                              (wasabi--date-label timestamp)
                            ;; No timestamp - use "Sometime"
                            "Sometime"))
-             (date-group (map-elt date-groups date-label)))
+             (date-group (gethash date-label groups)))
         (if date-group
-            ;; Append/modify existing group.
-            (setcdr date-group (append (cdr date-group) (list chat)))
-          ;; Create new group
-          (push (cons date-label (list chat)) date-groups))))
-    (nreverse date-groups)))
+            (push chat (cdr date-group))
+          ;; A new group, in the order its first chat came.
+          (let ((new (list date-label chat)))
+            (puthash date-label new groups)
+            (push new date-groups)))))
+    (mapcar (lambda (group)
+              (cons (car group) (nreverse (cdr group))))
+            (nreverse date-groups))))
 
 (cl-defun wasabi--format-chat-preview (&key display-name is-group last-updated)
   "Format a chat preview line for the chats list.
@@ -2167,6 +2230,10 @@ the days still read as groups while every line is a chat to open."
 
 (defun wasabi--refresh ()
   "Refresh the display based on current status."
+  ;; Drawing now makes any redraw that was asked for unnecessary.
+  (when (timerp wasabi--refresh-timer)
+    (cancel-timer wasabi--refresh-timer))
+  (setq wasabi--refresh-timer nil)
   (let* ((status (map-elt (wasabi--state) :status))
          (chats-index (map-elt (wasabi--state) :chats-index))
          ;; Save position
@@ -2203,6 +2270,44 @@ the days still read as groups while every line is a chat to open."
       ;; Not ready yet, display centered message.
       (wasabi--message :text (map-elt status :message))))))
 
+(defun wasabi--refresh-soon ()
+  "Redraw the chats list soon, at most once every `wasabi-refresh-delay'.
+
+A sync delivers histories and messages in bursts.  Drawing the list for
+each one kept Emacs redrawing instead of answering; this coalesces a
+burst into one redraw, as elfeed does with its search buffer."
+  (when (derived-mode-p 'wasabi-mode)
+    (unless wasabi--refresh-timer
+      (let ((buffer (current-buffer)))
+        (setq wasabi--refresh-timer
+              (run-at-time wasabi-refresh-delay nil
+                           (lambda ()
+                             (when (buffer-live-p buffer)
+                               (with-current-buffer buffer
+                                 (setq wasabi--refresh-timer nil)
+                                 (when (and (derived-mode-p 'wasabi-mode)
+                                            wasabi--state)
+                                   (wasabi--refresh)))))))))))
+
+(defun wasabi--schedule-chat-index-refresh ()
+  "Fetch the chat index again once messages stop arriving.
+
+Every incoming message used to fetch it, so a sync meant a fetch, a
+parse and a redraw per message."
+  (when wasabi--index-refresh-timer
+    (cancel-timer wasabi--index-refresh-timer))
+  (let ((buffer (current-buffer)))
+    (setq wasabi--index-refresh-timer
+          (run-at-time wasabi-index-refresh-delay nil
+                       (lambda ()
+                         (when (buffer-live-p buffer)
+                           (with-current-buffer buffer
+                             (setq wasabi--index-refresh-timer nil)
+                             (when (and (derived-mode-p 'wasabi-mode)
+                                        wasabi--state)
+                               (wasabi--send-chat-history-request
+                                :chat-jid "index")))))))))
+
 (defun wasabi--state ()
   "Get shell state or fail in an incompatible buffer."
   (unless (derived-mode-p 'wasabi-mode)
@@ -2217,6 +2322,15 @@ the days still read as groups while every line is a chat to open."
 For example, shut down wuzapi process."
   (unless (derived-mode-p 'wasabi-mode)
     (error "Not in a chats buffer"))
+  ;; Nothing deferred should outlive the buffer.
+  (dolist (timer '(wasabi--refresh-timer
+                   wasabi--index-refresh-timer
+                   wasabi--aliases-save-timer))
+    (when (symbol-value timer)
+      (when (timerp (symbol-value timer))
+        (cancel-timer (symbol-value timer)))
+      (set timer nil)))
+  (wasabi--save-jid-aliases)
   (when (map-elt (wasabi--state) :client)
     (acp-shutdown :client (map-elt (wasabi--state) :client))))
 
@@ -2321,7 +2435,7 @@ there as histories load and remembered here."
     (map-elt times (wasabi--canonical-jid chat-jid))))
 
 (defun wasabi--reparse-chat-index ()
-  "Read the stored chat index again and refresh the display.
+  "Read the stored chat index again and ask for the display to redraw.
 
 Names and times improve as contacts arrive and histories load, so the
 index is read again rather than refetched."
@@ -2339,7 +2453,9 @@ index is read again rather than refetched."
                                  (map-elt chat :chat-jid)
                                  wasabi--chat-times-table))
                               chats-index))
-      (wasabi--refresh))))
+      ;; The list is drawn once a burst of updates is over, rather than
+      ;; for each history or message that arrived.
+      (wasabi--refresh-soon))))
 
 (defun wasabi--merge-chat-index-entries (entries)
   "Merge ENTRIES that address the same peer under different JIDs.
@@ -2351,14 +2467,18 @@ in :alt-jids.
 
 History recorded under a superseded JID is not folded in: wuzapi stores
 it under that JID and we fetch one history per chat."
-  (let ((merged '()))
+  ;; Keyed rather than searched: scanning what has been merged so far for
+  ;; each entry made this quadratic, and a large account spent seconds in
+  ;; it every time the index was read again.
+  (let ((merged (make-hash-table :test 'equal))
+        (order '()))
     (dolist (entry entries)
-      (let ((existing (seq-find (lambda (candidate)
-                                  (equal (map-elt candidate :canonical-jid)
-                                         (map-elt entry :canonical-jid)))
-                                merged)))
+      (let* ((canonical (map-elt entry :canonical-jid))
+             (existing (gethash canonical merged)))
         (if (not existing)
-            (push (copy-alist entry) merged)
+            (let ((copy (copy-alist entry)))
+              (puthash canonical copy merged)
+              (push copy order))
           (map-put! existing :alt-jids
                     (append (map-elt existing :alt-jids)
                             (list (map-elt entry :chat-jid))
@@ -2368,7 +2488,7 @@ it under that JID and we fetch one history per chat."
                      (map-elt entry :named))
             (map-put! existing :display-name (map-elt entry :display-name))
             (map-put! existing :named t)))))
-    (nreverse merged)))
+    (nreverse order)))
 
 (defun wasabi--parse-chat-index (p-chat-index contacts groups &optional chats)
   "Parse chat index response to list of internal chat entries.
@@ -2378,7 +2498,8 @@ GROUPS is internal groups alist (already parsed).
 CHATS is the :chats alist of already fetched histories, used for real
 message times.
 Returns list of internal chat entry alists, filtered, sorted and merged."
-  (let* ((parsed (delq nil
+  (let* ((contacts (wasabi--contacts-table contacts))
+         (parsed (delq nil
                        (mapcar (lambda (p-entry)
                                  ;; Filter out status broadcasts
                                  (unless (equal (wasabi--jid-string (car p-entry))
