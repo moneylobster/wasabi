@@ -1700,12 +1700,16 @@ Optional SILENT suppresses visual messaging during status change."
   (unless (derived-mode-p 'wasabi-mode)
     (error "Not in a chats buffer"))
   (map-put! (wasabi--state) :status (wasabi--make-status :type type :message message))
-  ;; A background refresh is over once we are ready again.  Set to nil
-  ;; rather than deleted: `map-put!' can only update a key an alist
-  ;; already has, so removing it would break the next refresh.
-  (when (eq type 'ready)
+  ;; A background refresh is over once we are ready again, or once a
+  ;; status meant to be seen (an error, a disconnect, pairing) replaces
+  ;; it.  Set to nil rather than deleted: `map-put!' can only update a
+  ;; key an alist already has, so removing it would break the next
+  ;; refresh.
+  (when (or (eq type 'ready) (not silent))
     (map-put! (wasabi--state) :silent-refresh nil))
-  (if (eq type 'ready)
+  ;; A silent background re-fetch must not take the header away from a
+  ;; chat list that stays on screen; it names the refresh instead.
+  (if (or (eq type 'ready) silent)
       (wasabi--update-header-line)
     (setq header-line-format nil))
   (cond
@@ -2240,6 +2244,14 @@ the days still read as groups while every line is a chat to open."
          (saved-line (line-number-at-pos))
          (saved-col (current-column)))
     (cond
+     ;; A background re-fetch leaves the chat list on screen.  Redraws
+     ;; can still be asked for while it runs (timers, window changes,
+     ;; AppStateSyncComplete), and drawing the loading message then
+     ;; flashed the connecting screen over a list that was already up.
+     ;; The list is drawn again when the re-fetch reaches ready.
+     ((and (map-elt (wasabi--state) :silent-refresh)
+           (not (eq (map-elt status :type) 'ready)))
+      nil)
      ;; Only render chat list when status is 'ready
      ((eq (map-elt status :type) 'ready)
       (if (null chats-index)

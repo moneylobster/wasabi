@@ -96,5 +96,47 @@
     (should (string-match-p "Syncing with WhatsApp" (buffer-string)))
     (should-not (string-match-p "No recent chats" (buffer-string)))))
 
+(ert-deftest wasabi-sync-test-background-refresh-keeps-the-list ()
+  (wasabi-sync-test--with-buffer
+    (wasabi--set-status :type 'ready :message nil)
+    (should (string-match-p "No recent chats" (buffer-string)))
+    ;; A sync starts a silent re-fetch: the status becomes a loading one,
+    ;; but the list that is already up must stay.
+    (map-put! wasabi--state :silent-refresh t)
+    (wasabi--set-status :type 'fetch-contacts
+                        :message "Loading..." :silent t)
+    ;; Timers, window changes and AppStateSyncComplete can still ask for
+    ;; a redraw while the re-fetch runs.
+    (wasabi--refresh)
+    (should (string-match-p "No recent chats" (buffer-string)))
+    (should-not (string-match-p "Loading" (buffer-string)))
+    ;; The header line stays too, and says what is going on.
+    (should (string-match-p "Recent Chats"
+                            (substring-no-properties header-line-format)))
+    (should (string-match-p "refreshing"
+                            (substring-no-properties header-line-format)))
+    ;; Reaching ready draws the list again.
+    (wasabi--set-status :type 'ready :message nil)
+    (should (string-match-p "No recent chats" (buffer-string)))
+    (should-not (string-match-p "refreshing"
+                                (substring-no-properties header-line-format)))))
+
+(ert-deftest wasabi-sync-test-background-refresh-does-not-hide-errors ()
+  (wasabi-sync-test--with-buffer
+    (wasabi--set-status :type 'ready :message nil)
+    (map-put! wasabi--state :silent-refresh t)
+    (wasabi--set-status :type 'fetch-contacts
+                        :message "Loading..." :silent t)
+    (should-not (string-match-p "Loading" (buffer-string)))
+    ;; A status meant to be seen ends the silent refresh and is drawn.
+    (wasabi--set-status :type 'error :message "Something broke")
+    (should (string-match-p "Something broke" (buffer-string)))))
+
+(ert-deftest wasabi-sync-test-loading-screen-without-a-background-refresh ()
+  ;; Startup and pairing still show their status over an empty buffer.
+  (wasabi-sync-test--with-buffer
+    (wasabi--set-status :type 'fetch-contacts :message "Loading...")
+    (should (string-match-p "Loading" (buffer-string)))))
+
 (provide 'wasabi-sync-test)
 ;;; wasabi-sync-test.el ends here
