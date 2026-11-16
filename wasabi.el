@@ -920,7 +920,7 @@ For silent progression, set :silent-refresh in state before calling."
     (wasabi--send-chat-history-request
      :chat-jid "index"
      :on-finished (lambda ()
-                    (wasabi--log "Chat index loaded")
+                    (wasabi--log "Chat index fetch finished")
                     (wasabi--set-status :type 'ready :message nil))))
    ;; Expected statuse changes (nothing to do)
    ((memq status-type '(awaiting-connection qr paired already-connected ready error disconnected))
@@ -1128,7 +1128,25 @@ Invoke ON-FINISHED when done."
                     :on-failure (lambda (error)
                                   (wasabi--log "Failed to fetch chat index: %s"
                                                (or (map-elt error 'message) "unknown"))
-                                  (message "Failed to fetch chat history"))))
+                                  (cond
+                                   ;; A background index refresh: log it,
+                                   ;; but leave the list and its status
+                                   ;; alone.
+                                   ((not on-finished)
+                                    (message "Failed to fetch chat history"))
+                                   ;; A background re-fetch: finish the
+                                   ;; chain so the list stays and the sync
+                                   ;; indicator clears.
+                                   ((map-elt (wasabi--state) :silent-refresh)
+                                    (funcall on-finished))
+                                   ;; Startup: surface the failure rather
+                                   ;; than leaving the loading screen up
+                                   ;; forever.
+                                   (t
+                                    (wasabi--set-status
+                                     :type 'error
+                                     :message (wasabi--refresh-error
+                                               :message "Failed to fetch chats")))))))
 
 (cl-defun wasabi--send-chat-send-text-request (&key phone body context-info quoted-text
                                                     on-success on-failure)
@@ -1678,7 +1696,7 @@ The :connected flag tracks WhatsApp connection state (updated by notifications).
         (cons :syncing nil)
         (cons :sync-timer nil)))
 
-(cl-defun wasabi--make-status (&key type message)
+(cl-defun wasabi--make-status (&key type message silent)
   "Create a status object with TYPE and optional MESSAGE.
 
 TYPE can be one of:
@@ -1688,9 +1706,12 @@ TYPE can be one of:
   Data Loading: fetching-contacts, fetching-groups, fetching-chats
   Terminal: ready, error, disconnected
 
-MESSAGE is displayed if present.  When TYPE is ready, the chat list is rendered."
+MESSAGE is displayed if present.  When TYPE is ready, the chat list is rendered.
+SILENT marks a status set by a background re-fetch, which must not draw
+over the chat list."
   `((:type . ,type)
-    (:message . ,message)))
+    (:message . ,message)
+    (:silent . ,silent)))
 
 (cl-defun wasabi--set-status (&key type message silent)
   "Set the current status TYPE and MESSAGE and refresh the display.
@@ -1699,19 +1720,20 @@ Optional SILENT suppresses visual messaging during status change."
   (wasabi--log "Status change: %s \"%s\"" type message)
   (unless (derived-mode-p 'wasabi-mode)
     (error "Not in a chats buffer"))
-  (map-put! (wasabi--state) :status (wasabi--make-status :type type :message message))
-  ;; A background refresh is over once we are ready again, or once a
-  ;; status meant to be seen (an error, a disconnect, pairing) replaces
-  ;; it.  Set to nil rather than deleted: `map-put!' can only update a
-  ;; key an alist already has, so removing it would break the next
-  ;; refresh.
-  (when (or (eq type 'ready) (not silent))
+  (map-put! (wasabi--state) :status
+            (wasabi--make-status :type type :message message :silent silent))
+  ;; A background refresh is over once we are ready again.  Set to nil
+  ;; rather than deleted: `map-put!' can only update a key an alist
+  ;; already has, so removing it would break the next refresh.
+  (when (eq type 'ready)
     (map-put! (wasabi--state) :silent-refresh nil))
   ;; A silent background re-fetch must not take the header away from a
-  ;; chat list that stays on screen; it names the refresh instead.
-  (if (or (eq type 'ready) silent)
+  ;; chat list that stays on screen.  Leave it as it is: the sync
+  ;; indicator already names the refresh.
+  (if (eq type 'ready)
       (wasabi--update-header-line)
-    (setq header-line-format nil))
+    (unless silent
+      (setq header-line-format nil)))
   (cond
    ;; A background sync says it is ready again every time a batch lands;
    ;; draw the list once the burst is over rather than once per batch.
@@ -2232,6 +2254,31 @@ the days still read as groups while every line is a chat to open."
      groups labels)
     (nreverse lines)))
 
+(defun wasabi--render-chats (chats-index saved-line saved-col)
+  "Draw CHATS-INDEX, or the empty state, restoring point.
+SAVED-LINE and SAVED-COL are where point was before the redraw."
+  (if (null chats-index)
+      ;; No chats available - show empty state
+      (wasabi--message :text
+                       (if (wasabi--syncing)
+                           (concat "Syncing with WhatsApp"
+                                   "\n\n"
+                                   "Chats will appear as they arrive")
+                         (concat
+                          "No recent chats"
+                          "\n\n"
+                          (propertize "c" 'face 'help-key-binding)
+                          " "
+                          "to start a new chat")))
+    ;; Render chat list: every line a chat.
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert (mapconcat #'identity (wasabi--chat-list-lines chats-index) "\n")))
+    ;; Restore point position
+    (goto-char (point-min))
+    (forward-line (1- saved-line))
+    (move-to-column saved-col)))
+
 (defun wasabi--refresh ()
   "Refresh the display based on current status."
   ;; Drawing now makes any redraw that was asked for unnecessary.
@@ -2244,40 +2291,13 @@ the days still read as groups while every line is a chat to open."
          (saved-line (line-number-at-pos))
          (saved-col (current-column)))
     (cond
-     ;; A background re-fetch leaves the chat list on screen.  Redraws
-     ;; can still be asked for while it runs (timers, window changes,
-     ;; AppStateSyncComplete), and drawing the loading message then
-     ;; flashed the connecting screen over a list that was already up.
-     ;; The list is drawn again when the re-fetch reaches ready.
-     ((and (map-elt (wasabi--state) :silent-refresh)
-           (not (eq (map-elt status :type) 'ready)))
-      nil)
-     ;; Only render chat list when status is 'ready
-     ((eq (map-elt status :type) 'ready)
-      (if (null chats-index)
-          ;; No chats available - show empty state
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            (wasabi--message :text
-                             (if (wasabi--syncing)
-                                 (concat "Syncing with WhatsApp"
-                                         "\n\n"
-                                         "Chats will appear as they arrive")
-                               (concat
-                                "No recent chats"
-                                "\n\n"
-                                (propertize "c" 'face 'help-key-binding)
-                                " "
-                                "to start a new chat"))))
-        ;; Render chat list: every line a chat.
-        (progn
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            (insert (mapconcat #'identity (wasabi--chat-list-lines chats-index) "\n")))
-          ;; Restore point position
-          (goto-char (point-min))
-          (forward-line (1- saved-line))
-          (move-to-column saved-col))))
+     ;; A background re-fetch keeps the chat list on screen, and keeps it
+     ;; up to date as data arrives.  It must never draw its loading
+     ;; message over the list: that flashed the connecting screen after
+     ;; a sync.  The list is drawn again when the re-fetch reaches ready.
+     ((or (eq (map-elt status :type) 'ready)
+          (map-elt status :silent))
+      (wasabi--render-chats chats-index saved-line saved-col))
      ((map-elt status :message)
       ;; Not ready yet, display centered message.
       (wasabi--message :text (map-elt status :message))))))
